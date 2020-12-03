@@ -130,7 +130,7 @@ func receiverService(rcv chan *testInfo, done chan bool) {
     defer func() { done<-true }() // close the channel once done
 
     if(len(outArg) > 0){
-                
+
         os.Remove(outArg)
         file, err := os.OpenFile(outArg, os.O_WRONLY | os.O_CREATE, 0644)
         if err != nil {
@@ -278,10 +278,10 @@ func main() {
     flag.StringVar(&testDomainArg, "domain", "example.com", "Domain name to test against")
     
     flag.IntVar(&numWorkersArg, "workers", 10, "Number of workers")
-	flag.IntVar(&numTestsArg, "tests", 10, "Number of workers")
-    flag.IntVar(&timefilterArg, "filter-time", 0, "Number of workers")
-    flag.IntVar(&errorfilterArg, "filter-errors", 0, "Number of workers")
-    flag.IntVar(&ratefilterArg, "filter-rate", 0, "Number of workers")
+    flag.IntVar(&numTestsArg, "tests", 10, "Number of test again each dns server")
+    flag.IntVar(&timefilterArg, "filter-time", 0, "Filter results with average response time higher than")
+    flag.IntVar(&errorfilterArg, "filter-errors", 0, "Filter results with error number higher than")
+    flag.IntVar(&ratefilterArg, "filter-rate", 0, "Filter results with average success rate less than")
     
     flag.BoolVar(&saveJustDNSArg, "save-dns", false, "Save just the DNS hostname")
 
