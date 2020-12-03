@@ -287,12 +287,12 @@ func main() {
 
     flag.Parse();
 
-    if numWorkersArg < 1 || numWorkersArg > 100 {
+    if numWorkersArg < 1 || numWorkersArg > 251 {
         fmt.Fprintf(os.Stderr, "[!] Invalid number of workers: %d\n", numWorkersArg)
         return
     }
 
-    if numTestsArg < 1  || numTestsArg > 500{
+    if numTestsArg < 1  || numTestsArg > 5000{
         fmt.Fprintf(os.Stderr, "[!] Invalid number of tests: %d\n", numTestsArg)
         return
     }
