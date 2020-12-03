@@ -181,7 +181,7 @@ func receiverService(rcv chan *testInfo, done chan bool) {
                 cur.filtered = true
             }
 
-            if ratefilterArg > 0 && succP > ratefilterArg{
+            if ratefilterArg > 0 && succP < ratefilterArg{
                 //fmt.Printf("%v filtered by ratelimit!: %v || %v\n", cur.dns, ratefilterArg, succP)
                 cur.filtered = true
             }
