@@ -303,7 +303,7 @@ func checkTruncation(DNSServer string)bool{
     
     var total int = 0
 
-    for i := 0; i < 5; i++ {
+    for i := 0; i < 20; i++ {
         
         c := dns.Client{}
         m := dns.Msg{}
@@ -344,7 +344,7 @@ func main() {
     flag.IntVar(&errorfilterArg, "filter-errors", 0, "Filter results with error number higher than")
     flag.IntVar(&ratefilterArg, "filter-rate", 0, "Filter results with average success rate less than")
     
-    flag.BoolVar(&saveJustDNSArg, "save-dns", false, "Save just the DNS hostname")
+    flag.BoolVar(&saveJustDNSArg, "save-dns", true, "Save just the DNS hostname")
 
     flag.Parse();
 
