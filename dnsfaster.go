@@ -6,6 +6,7 @@ import (
     "os"
     "time"
     "strings"
+    "sync"
     "math/rand"
     
     "github.com/miekg/dns"
@@ -48,7 +49,9 @@ var (
     
 	inArg		        string
 	outArg            	string
-	testDomainArg     	string
+    testDomainArg     	string
+    
+    globalDNSList       []string
 )
 
 func randStringBytes(n int) string {
@@ -59,10 +62,10 @@ func randStringBytes(n int) string {
     return string(b)
 }
 
-func getDNSList() ([]string, error) {
-    file, err := os.Open(inArg)
+func getDNSList(DNSServersFile string) ([]string, error) {
+    file, err := os.Open(DNSServersFile)
     if err != nil {
-        return nil, fmt.Errorf("[!!!] Can't open file: %s", inArg)
+        return nil, fmt.Errorf("[!!!] Can't open file: %s", DNSServersFile)
     }
     defer file.Close()
 
@@ -225,12 +228,11 @@ func distributorService(){
 
     printHeader()
 
-    resolvers, err := getDNSList()
-    if err != nil {
-        fmt.Println(err)
-        return
+    if(len(globalDNSList) < 1){
+        fmt.Printf("The DNS server list is empty, I can't go.\n")
+        os.Exit(0)
     }
-
+    
     // pregenerate test cases
     var domains []string
     for i := 0; i < numTestsArg; i++ {
@@ -249,7 +251,7 @@ func distributorService(){
     }
 
     for i := 0; i < numTestsArg; i++ {
-        for _, dns := range resolvers {
+        for _, dns := range globalDNSList {
             test := new(testInfo)
             test.dns = dns
             test.domain = domains[i]
@@ -269,6 +271,65 @@ func distributorService(){
     }
 
     <-rcvDone
+}
+
+func checkDNSList(DNSServerList []string){
+
+    jobs := make(chan string)
+	var wg sync.WaitGroup
+	
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			for task := range jobs {				
+                v:=checkTruncation(task)
+                if(!v){
+                    globalDNSList = append(globalDNSList, task)
+                }
+			}
+			wg.Done()
+		}()
+	}
+		
+	for _, line := range DNSServerList {
+		jobs <- line
+	}
+	
+	close(jobs)	
+    wg.Wait()
+}
+
+func checkTruncation(DNSServer string)bool{
+    
+    var total int = 0
+
+    for i := 0; i < 5; i++ {
+        
+        c := dns.Client{}
+        m := dns.Msg{}
+    
+        m.SetQuestion("example.com" + ".", dns.TypeA)
+        r, _, err := c.Exchange(&m, DNSServer + ":53")
+
+        if(err != nil){
+            //fmt.Printf("err: %v\n", err)
+            total++
+            continue
+        }
+
+        if (r != nil && r.Truncated) {
+            //fmt.Printf("[truncate | %v]: %v\n", DNSServer, m.Question[0].String())
+            total++
+        }
+    }
+
+    if(total == 0){
+        //fmt.Printf("[%v] truncation OK\n", DNSServer)
+        return false
+    }
+
+    //fmt.Printf("[%v] truncation FAIL\n", DNSServer)
+    return true
 }
 
 func main() {
@@ -297,5 +358,9 @@ func main() {
         return
     }
 
+    var localDNSList []string
+    localDNSList, _ = getDNSList(inArg)
+    
+    checkDNSList(localDNSList)   
     distributorService()
 }
