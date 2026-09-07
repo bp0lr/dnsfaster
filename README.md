@@ -67,7 +67,7 @@ The documentation addresses above are placeholders. Replace them with your refer
 - Negative validation requires `NXDOMAIN` without answer records for random names under the root domain and, by default, `facebook.com`, `paypal.com`, `google.com`, `bet365.com` and `wikileaks.com`.
 - `--negative-domain` replaces the extra default domains; the root domain always remains included. Use `--negative-domain=` to check only the root domain.
 - `--baseline-quorum` must be a strict majority of distinct configured reference endpoints. Duplicate endpoints do not add votes. Different hostnames may still refer to the same physical resolver; select independent references yourself.
-- Failure to reach quorum stops the run before candidate checks and preserves existing output. A successful majority can tolerate a disagreeing or unavailable minority.
+- Failure to reach quorum stops the run before candidate checks and preserves existing output. A successful majority can tolerate a disagreeing or unavailable minority. As soon as every question reaches quorum, pending reference queries are canceled and their workers are joined before candidate checks start. An impossible quorum also stops early.
 
 Domains with geographically varying or changing answer sets can fail this comparison even when the resolvers are working. Select a stable domain you control, or supply explicit expected answers.
 
@@ -79,7 +79,23 @@ This mode contacts candidate resolvers only. It does not query public reference 
 dnsfaster --resolver 127.0.0.1:5353 --domain service.internal --validation expected --expect service.internal=192.0.2.10,192.0.2.11 --negative-domain= --out resolvers.txt
 ```
 
-Configure your local DNS server with the corresponding records first. Every positive domain must have a complete expected A-record set. Use repeated `--positive-domain` and `--expect` flags for multiple domains. In baseline mode, explicit answers can also override the positive expectation for selected domains while the remaining reference checks continue.
+Configure your local DNS server with the corresponding records first. Every positive domain must have a nonempty, complete expected set for each selected record type. Use repeated `--positive-domain` and `--expect` flags for multiple domains. In baseline mode, explicit answers can also override the positive expectation for selected domains while the remaining reference checks continue.
+
+### A and AAAA validation
+
+`--record-types A` is the default. Use `--record-types AAAA` or `--record-types A,AAAA` to validate IPv6 answers, including CNAME chains. Positive and negative checks run independently for every selected type. A domain without addresses of a selected type fails validation; choose domains that publish those records.
+
+```sh
+dnsfaster --resolver 127.0.0.1:5353 --domain service.internal --validation expected --record-types A,AAAA --expect service.internal=192.0.2.10,2001:db8::10 --negative-domain=
+```
+
+`--expect` infers the record type from each address and normalizes IPv6 spelling. Each supplied family must be enabled by `--record-types`. In baseline mode, an explicit A set can override A while references determine AAAA, or vice versa. Resolver transport addresses and DNS record types are independent: an IPv4 resolver endpoint can answer AAAA queries. Prechecks and latency measurements remain A queries.
+
+### Bounded validation retries
+
+`--validation-retries 1` allows one extra attempt after a timeout or transport failure in reference and candidate correctness checks. Set it to `0` to disable retries, or up to `3`. Mismatched answers, missing records, invalid replies and DNS error codes such as SERVFAIL are not retried. Each attempt uses the shared QPS limiter and its own `--timeout`; `--max-duration` still bounds the whole run. With one retry, a failed logical check can consume two query timeouts plus rate-limit waits.
+
+Prechecks and measurement queries do not use these retries. Their failures remain visible in the measurement results.
 
 ### Measurement-only compatibility mode
 
@@ -139,18 +155,20 @@ Get-Content dnslist.txt | dnsfaster --in - --out - --format json --include-filte
 | `--out` | Unset | Output file or `-` for stdout. Without it, show only console diagnostics. |
 | `--domain` | `example.com` | Positive root domain and base for measured random queries. |
 | `--validation` | `baseline` | Correctness mode: `baseline`, `expected` or `off`. |
+| `--record-types` | `A` | Correctness types: `A`, `AAAA` or `A,AAAA`; prechecks and measurements remain A. |
+| `--validation-retries` | `1` | Extra attempts after correctness timeout/transport failures, from 0 to 3. |
 | `--baseline` | Three public references | Reference endpoints; repeatable or comma-separated. Replaces the defaults. |
 | `--baseline-quorum` | Strict majority | Required identical reference responses; `0` calculates the majority. |
 | `--positive-domain` | Unset | Additional positive domains; repeatable or comma-separated. |
 | `--negative-domain` | Five extra domains | Replace default negative-check domains; root always included. |
-| `--expect` | Unset | Expected A answers as `domain=IPv4,IPv4`; repeatable. |
+| `--expect` | Unset | Expected addresses as `domain=IP,IP`; repeatable, with family inferred from each address. |
 | `--query-prefix` | Unset | Optional DNS label prefix, at most 46 characters, before a random suffix. |
 | `--workers` | `10` | Concurrent candidate checks, from 1 to 251. One resolver per worker. |
 | `--tests` | `10` | Measured queries per resolver, from 1 to 5000. |
 | `--timeout` | `2s` | Per-query timeout, including an optional TCP retry. |
 | `--max-duration` | `0` | Overall timeout for source downloads and DNS work; zero disables it. |
 | `--qps` | `50` | Positive global query rate limit, at most 1000000. |
-| `--precheck-tests` | `3` | Extra root-domain prechecks; `0` disables them, maximum 1000. |
+| `--precheck-tests` | Adaptive | `0` with correctness validation, `3` with `--validation off`. Explicit values override this; maximum 1000. |
 | `--precheck-errors` | `1` | Allowed precheck failures. At least one must succeed when enabled. |
 | `--filter-time` | `0` | Maximum average measurement latency in milliseconds; zero disables it. |
 | `--filter-p95` | `0` | Maximum p95 measurement latency in milliseconds; zero disables it. |
@@ -177,7 +195,7 @@ The console report and final summary use **stderr**. With `--out -`, stdout cont
 CSV columns:
 
 ```text
-resolver,average_ms,success_percent,successes,failures,p50_ms,p95_ms,precheck_failures,filtered,reasons,errors,validation_checks,validation_failures
+resolver,average_ms,success_percent,successes,failures,p50_ms,p95_ms,precheck_failures,filtered,reasons,errors,validation_checks,validation_failures,validation_retries
 ```
 
 JSON uses the same names, with arrays for `reasons` and an object for `errors`. The CSV `errors` cell is a JSON object. CSV prints three decimal places; JSON retains computed precision. An empty JSON export is `[]`. The legacy CSV format remains:
@@ -190,7 +208,7 @@ After correctness validation, optional prechecks require a nontruncated `NOERROR
 
 Percentiles use nearest rank. With ten successful samples, p95 equals the maximum; use more samples when ranking tail latency. No successful measurements always means rejection. Latency fields are zero in structured exports when there are no successful samples; the console displays `n/a`.
 
-A validation failure rejects the resolver immediately and skips its prechecks and measurements. Validation checks/failures and precheck failures have separate counters. Reasons identify positive mismatches, missing answers, negative-check failures, timeouts, transport errors and unexpected DNS codes.
+A validation failure rejects the resolver immediately and skips its prechecks and measurements. Validation checks/failures and precheck failures have separate counters. `validation_checks` counts logical candidate checks, `validation_failures` counts terminal failures, and `validation_retries` counts extra candidate attempts, including recovered failures. Reference retries are shared setup work and do not enter per-candidate counters. Reasons identify positive mismatches, missing answers, negative-check failures, timeouts, transport errors and unexpected DNS codes.
 
 TCP fallback shares the UDP query's timeout budget and the global limiter. Waiting for the initial rate-limit slot is excluded from latency. Connection setup and a TCP retry, including its rate-limit wait, are included. Every query opens a fresh connection. Caches, wildcard DNS and network conditions affect results; random labels do not guarantee every upstream query bypasses caching.
 
@@ -211,7 +229,7 @@ File exports are written to a temporary file in the destination directory and re
 | --- | --- |
 | Single resolver, list or stdin | `--resolver`, `--in`, `--in -` |
 | Lists and exclusions from files or URLs | `--in`, `--exclude`, `--exclude-file`; CIDRs also supported |
-| Positive answers against trusted references | Complete relevant A sets, configurable majority and explicit expected-answer mode |
+| Positive answers against trusted references | Complete relevant A/AAAA sets, configurable majority and explicit expected-answer mode |
 | Negative checks across multiple domains | Root plus five default domains, configurable replacements and query prefix |
 | Concurrent checks and time limits | Worker pool, per-query and overall timeout, shared rate limit |
 | Quiet and verbose diagnostics | `--quiet`, `--verbose`, clean stdout exports; output is always uncolored |
@@ -221,21 +239,43 @@ CLI flag spelling is not intended to be a drop-in replacement. Candidates must b
 
 ## Performance and compatibility
 
-The older version sent 20 prechecks and 10 measurements per healthy resolver. Measurement-only mode now uses 3 prechecks and 10 measurements, reducing that count from 30 to 13. Default correctness validation adds one positive and six negative checks, for **20 queries per healthy candidate**, plus **21 shared reference queries per run** with the default three references. Additional domains, retries or custom settings change these totals.
+Default A validation now sends **17 queries per healthy candidate**: one positive check, six negative checks and ten measurements. This is 15% fewer than the previous 20-query default because strict validation makes the three extra prechecks redundant. Measurement-only mode retains three prechecks and ten measurements. Explicit `--precheck-tests` values always win.
 
-For fewer redundant root probes after strict correctness validation, use `--precheck-tests 0`. A precheck stops as soon as its failure allowance is exceeded. Duplicate candidates are eliminated before scheduling, sample buffers are reused per worker, and reference results are computed only once.
+With three healthy default references and no retries, shared setup sends 14 to 21 queries, depending on scheduling and early cancellation after quorum. A silent minority no longer forces the majority to wait for its timeout. Selecting both A and AAAA increases candidate correctness checks from 7 to 14, for 24 total queries with the default ten A measurements. Additional domains, retries and TCP fallback can increase these counts.
 
-Local measurements on September 7, 2026, Go 1.27.1, Windows amd64, Ryzen 9 3900X:
+### Controlled comparison with dnsvalidator
 
-| Benchmark | Work per iteration | Time | Allocations |
+The reproducible harness is [benchmarks/compare.py](benchmarks/compare.py). It uses the unmodified [dnsvalidator revision `146c9b0`](https://github.com/vortexau/dnsvalidator/tree/146c9b0e24d806b25697fbb541bf9f19a3086d41), with a runtime adapter that maps reference and candidate addresses to ephemeral loopback ports and sets dnspython's query timeout/lifetime to 200 ms. The adapter blocks outbound traffic outside loopback. It does not change upstream acceptance logic.
+
+Conditions: September 7, 2026, Windows amd64, Ryzen 9 3900X, Go 1.27.1, Python 3.12.3, dnspython 2.8.0, psutil 7.2.2, requests 2.34.2 and colorclass 2.2.2. Each case has one excluded warmup followed by five measured runs, alternating program order. Both use ten workers and the same local UDP fixture. dnsfaster uses a QPS limit of 1000000 so the default production rate limit does not dominate this throughput experiment.
+
+| Workload | Tool | Median seconds | Median peak MiB |
 | --- | --- | --- | --- |
-| Previous measurement path | Four local queries | 1.153 ms, one sample | 202 |
-| Current measurement path | Four local queries with reply validation | 1.216-1.264 ms, three samples | 202-203 |
-| Validated resolver | One positive, two negative and two measured queries | 1.663-1.735 ms, three samples | 262 |
+| equivalent | dnsfaster | 0.108 | 13.4 |
+| equivalent | dnsvalidator | 0.904 | 45.8 |
+| full | dnsfaster | 0.292 | 14.9 |
+| full | dnsvalidator | 0.964 | 45.8 |
+| correctness | dnsfaster | 0.644 | 11.0 |
+| correctness | dnsvalidator | 2.756 | 45.6 |
 
-These use a local resolver on an ephemeral port with rate limiting disabled inside the benchmark. The validated-resolver benchmark excludes shared reference setup. They measure different work and do not establish a speedup against dnsvalidator. The modest measured-path increase adds reply validation; repeat under the same conditions before attributing small timing differences to code changes.
+Time includes process startup, Python imports, execution and exit. Memory is the median OS peak working set of each child process, sampled every 2 ms; the shared fixture and runner are excluded. These are local end-to-end tool measurements, not network latency results or a guarantee of the same ratios on other systems. The Python fixture, interpreter startup and Windows scheduling affect the results.
 
-Existing flags remain available. The main behavior change is default correctness validation; use `--validation off` for the previous measurement-only behavior. Runtime errors now have nonzero exit codes, reports use stderr, and legacy CSV values retain decimal precision.
+- **Equivalent workload:** 100 healthy candidates, six A/NXDOMAIN queries each under the same root, zero reference queries. dnsfaster uses `--validation off --precheck-tests 0 --tests 6 --filter-rate 100`; the adapter invokes upstream's candidate function with preloaded reference state and five repeated root checks. The harness asserts exactly 600 candidate queries for each tool. Both accept all 100 candidates. Random label generation remains specific to each tool.
+- **Full validation:** 100 healthy candidates, shared setup included, two local references for both tools. dnsfaster sends 1700 candidate queries plus 14 reference queries; upstream sends 600 plus 8. Both accept all candidates. The different work means this row cannot isolate algorithmic speed.
+- **Correctness:** 30 candidates, six each that are healthy, return an incorrect positive A set, substitute answers for nonexistent names, stay silent, or drop the first packet and then answer correctly. The expected accepted set contains the 12 healthy or recovering candidates. dnsfaster has zero false accepts and zero false rejects; this upstream revision has six false accepts and zero false rejects in every repetition. The affected cases are the incorrect positive A sets. This finite synthetic sample is not a general accuracy estimate. AAAA is covered separately by dnsfaster integration tests because the upstream check uses A.
+
+To reproduce, use Python 3.12 with the dependency versions listed above, then run from the repository root:
+
+```sh
+git clone https://github.com/vortexau/dnsvalidator.git dist/dnsvalidator-upstream
+git -C dist/dnsvalidator-upstream checkout 146c9b0e24d806b25697fbb541bf9f19a3086d41
+go build -trimpath -o dist/dnsfaster-benchmark .
+python benchmarks/compare.py --binary dist/dnsfaster-benchmark --upstream dist/dnsvalidator-upstream
+```
+
+On Windows, add `.exe` to the build output and `--binary` argument. The harness writes individual process outputs and raw measurements, binary SHA-256 and build metadata to ignored `dist/comparison/`, including `results.json`. It does not download resolver lists or run queries against public resolvers. Benchmark dependencies are developer tools only; the Go binary does not depend on Python.
+
+Existing flags remain available. Use `--validation off` for measurement-only behavior, and specify `--precheck-tests 3` to retain extra probes alongside correctness validation. Legacy CSV remains five columns; headered CSV appends the retry counter after existing fields.
 
 ## Development
 
