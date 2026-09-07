@@ -97,7 +97,7 @@ func writeResults(dest io.Writer, results []resultStats, format string, includeF
 	if format == "csv" || format == "legacy-csv" {
 		w := csv.NewWriter(dest)
 		if format == "csv" {
-			if err := w.Write([]string{"resolver", "average_ms", "success_percent", "successes", "failures", "p50_ms", "p95_ms", "precheck_failures", "filtered", "reasons", "errors"}); err != nil {
+			if err := w.Write([]string{"resolver", "average_ms", "success_percent", "successes", "failures", "p50_ms", "p95_ms", "precheck_failures", "filtered", "reasons", "errors", "validation_checks", "validation_failures"}); err != nil {
 				return err
 			}
 		}
@@ -109,6 +109,7 @@ func writeResults(dest io.Writer, results []resultStats, format string, includeF
 					return err
 				}
 				row = append(row, decimal(r.P50MS), decimal(r.P95MS), strconv.Itoa(r.PrecheckFailures), strconv.FormatBool(r.Filtered), strings.Join(r.Reasons, ";"), string(details))
+				row = append(row, strconv.Itoa(r.ValidationChecks), strconv.Itoa(r.ValidationFailures))
 			}
 			if err := w.Write(row); err != nil {
 				return err
@@ -124,6 +125,24 @@ func writeResults(dest io.Writer, results []resultStats, format string, includeF
 		}
 	}
 	return w.Flush()
+}
+
+func selectExports(results []resultStats, top int, includeFiltered bool) []resultStats {
+	selected := make([]resultStats, 0, len(results))
+	passing := 0
+	for _, r := range results {
+		if r.Filtered {
+			if includeFiltered {
+				selected = append(selected, r)
+			}
+			continue
+		}
+		if top == 0 || passing < top {
+			selected = append(selected, r)
+			passing++
+		}
+	}
+	return selected
 }
 
 func decimal(n float64) string { return strconv.FormatFloat(n, 'f', 3, 64) }

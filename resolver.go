@@ -5,9 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"math/rand/v2"
 	"net"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,18 +16,20 @@ import (
 )
 
 type resultStats struct {
-	Resolver         string         `json:"resolver"`
-	AverageMS        float64        `json:"average_ms"`
-	P50MS            float64        `json:"p50_ms"`
-	P95MS            float64        `json:"p95_ms"`
-	SuccessRate      float64        `json:"success_percent"`
-	Successes        int            `json:"successes"`
-	Failures         int            `json:"failures"`
-	PrecheckFailures int            `json:"precheck_failures"`
-	Filtered         bool           `json:"filtered"`
-	Reasons          []string       `json:"reasons"`
-	Errors           map[string]int `json:"errors"`
-	index            int
+	Resolver           string         `json:"resolver"`
+	AverageMS          float64        `json:"average_ms"`
+	P50MS              float64        `json:"p50_ms"`
+	P95MS              float64        `json:"p95_ms"`
+	SuccessRate        float64        `json:"success_percent"`
+	Successes          int            `json:"successes"`
+	Failures           int            `json:"failures"`
+	PrecheckFailures   int            `json:"precheck_failures"`
+	ValidationChecks   int            `json:"validation_checks"`
+	ValidationFailures int            `json:"validation_failures"`
+	Filtered           bool           `json:"filtered"`
+	Reasons            []string       `json:"reasons"`
+	Errors             map[string]int `json:"errors"`
+	index              int
 }
 
 type queryClient struct {
@@ -51,8 +53,13 @@ func exchange(ctx context.Context, client *dns.Client, msg *dns.Msg, address str
 }
 
 func (c *queryClient) query(ctx context.Context, msg *dns.Msg, address string, expected int) (float64, string) {
+	_, elapsed, reason := c.lookup(ctx, msg, address, expected)
+	return elapsed, reason
+}
+
+func (c *queryClient) lookup(ctx context.Context, msg *dns.Msg, address string, expected int) (*dns.Msg, float64, string) {
 	if err := c.limiter.Wait(ctx); err != nil {
-		return 0, "canceled"
+		return nil, 0, "canceled"
 	}
 	queryCtx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
@@ -61,9 +68,9 @@ func (c *queryClient) query(ctx context.Context, msg *dns.Msg, address string, e
 	if err == nil && reply != nil && reply.Truncated && c.fallback {
 		if err = c.limiter.Wait(queryCtx); err != nil {
 			if ctx.Err() != nil {
-				return 0, "canceled"
+				return nil, 0, "canceled"
 			}
-			return 0, "timeout"
+			return nil, 0, "timeout"
 		}
 		reply, err = exchange(queryCtx, &c.tcp, msg, address)
 	}
@@ -72,31 +79,41 @@ func (c *queryClient) query(ctx context.Context, msg *dns.Msg, address string, e
 		var networkErr net.Error
 		switch {
 		case ctx.Err() != nil:
-			return 0, "canceled"
+			return nil, 0, "canceled"
 		case queryCtx.Err() != nil || (errors.As(err, &networkErr) && networkErr.Timeout()):
-			return 0, "timeout"
+			return nil, 0, "timeout"
 		default:
-			return 0, "transport"
+			return nil, 0, "transport"
 		}
 	}
 	if reply == nil {
-		return 0, "empty_response"
+		return nil, 0, "empty_response"
+	}
+	if !reply.Response || reply.Opcode != msg.Opcode || len(reply.Question) != 1 || len(msg.Question) != 1 || !strings.EqualFold(reply.Question[0].Name, msg.Question[0].Name) || reply.Question[0].Qtype != msg.Question[0].Qtype || reply.Question[0].Qclass != msg.Question[0].Qclass {
+		return nil, 0, "invalid_response"
 	}
 	if reply.Truncated {
-		return 0, "truncated"
+		return nil, 0, "truncated"
 	}
 	if reply.Rcode != expected {
 		name, ok := dns.RcodeToString[reply.Rcode]
 		if !ok {
 			name = fmt.Sprint(reply.Rcode)
 		}
-		return 0, "rcode_" + name
+		return nil, 0, "rcode_" + name
 	}
-	return elapsed, ""
+	if expected == dns.RcodeNameError && len(reply.Answer) != 0 {
+		return nil, 0, "unexpected_answers"
+	}
+	return reply, elapsed, ""
 }
 
-func checkResolver(ctx context.Context, c config, server endpoint, names []string, client *queryClient, samples []float64) resultStats {
+func checkResolver(ctx context.Context, c config, server endpoint, names []string, client *queryClient, samples []float64, plan validationPlan) resultStats {
 	r := resultStats{Resolver: server.label, Reasons: []string{}, Errors: make(map[string]int)}
+	validateResolver(ctx, plan, server, client, &r)
+	if r.Filtered || ctx.Err() != nil {
+		return r
+	}
 	var msg dns.Msg
 	msg.SetQuestion(c.domain, dns.TypeA)
 	precheckSuccesses := 0
@@ -150,6 +167,9 @@ func checkResolver(ctx context.Context, c config, server endpoint, names []strin
 	if c.maxTime > 0 && r.AverageMS > c.maxTime {
 		r.Reasons = append(r.Reasons, "latency")
 	}
+	if c.maxP95 > 0 && r.P95MS > c.maxP95 {
+		r.Reasons = append(r.Reasons, "p95_latency")
+	}
 	if c.maxErrors > 0 && r.Failures > c.maxErrors {
 		r.Reasons = append(r.Reasons, "errors")
 	}
@@ -168,13 +188,28 @@ func percentile(sorted []float64, p float64) float64 {
 }
 
 func measure(ctx context.Context, c config, servers []endpoint) ([]resultStats, error) {
+	return measureWithProgress(ctx, c, servers, nil)
+}
+
+func measureWithProgress(ctx context.Context, c config, servers []endpoint, progress *progressReporter) ([]resultStats, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	// All resolvers receive the same names. Only the selected base domain is tested.
 	names := make([]string, c.tests)
 	for i := range names {
-		names[i] = fmt.Sprintf("%016x.%s", rand.Uint64(), c.domain)
+		names[i] = randomName(c.domain, c.queryPrefix)
 	}
 	workers := min(c.workers, len(servers))
 	limiter := rate.NewLimiter(rate.Limit(c.qps), 1)
+	plan, err := prepareValidation(ctx, c, limiter)
+	if err != nil {
+		return nil, err
+	}
+	if progress != nil {
+		if err := progress.phase("checking candidates"); err != nil {
+			return nil, err
+		}
+	}
 	jobs := make(chan int)
 	results := make(chan resultStats, workers)
 	var wg sync.WaitGroup
@@ -182,13 +217,13 @@ func measure(ctx context.Context, c config, servers []endpoint) ([]resultStats, 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			client := queryClient{udp: dns.Client{Net: "udp", Timeout: c.timeout}, tcp: dns.Client{Net: "tcp", Timeout: c.timeout}, limiter: limiter, fallback: c.tcpFallback, timeout: c.timeout}
+			client := newQueryClient(c, limiter)
 			samples := make([]float64, 0, c.tests)
 			for index := range jobs {
 				if ctx.Err() != nil {
 					return
 				}
-				r := checkResolver(ctx, c, servers[index], names, &client, samples)
+				r := checkResolver(ctx, c, servers[index], names, client, samples, plan)
 				r.index = index
 				select {
 				case results <- r:
@@ -210,8 +245,35 @@ func measure(ctx context.Context, c config, servers []endpoint) ([]resultStats, 
 	}()
 	go func() { wg.Wait(); close(results) }()
 	collected := make([]resultStats, 0, len(servers))
-	for r := range results {
-		collected = append(collected, r)
+	var ticks <-chan time.Time
+	if progress != nil && progress.enabled {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		ticks = ticker.C
+	}
+	var reportErr error
+collect:
+	for {
+		select {
+		case r, ok := <-results:
+			if !ok {
+				break collect
+			}
+			collected = append(collected, r)
+			if progress != nil && reportErr == nil {
+				reportErr = progress.complete(r)
+			}
+		case <-ticks:
+			if reportErr == nil {
+				reportErr = progress.tick()
+			}
+		}
+		if reportErr != nil {
+			cancel()
+		}
+	}
+	if reportErr != nil {
+		return nil, reportErr
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -233,6 +295,9 @@ func sortResults(results []resultStats, by string) {
 		}
 		if by == "rate" && a.SuccessRate != b.SuccessRate {
 			return a.SuccessRate > b.SuccessRate
+		}
+		if by == "p95" && a.P95MS != b.P95MS {
+			return a.P95MS < b.P95MS
 		}
 		if a.AverageMS != b.AverageMS {
 			return a.AverageMS < b.AverageMS

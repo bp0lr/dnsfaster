@@ -22,7 +22,26 @@ import (
 
 func localDNS(t testing.TB, handler dns.HandlerFunc, tcp bool) endpoint {
 	t.Helper()
-	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	var packet net.PacketConn
+	var listener net.Listener
+	var err error
+	if tcp {
+		// Let TCP choose a permitted port first. On Windows, a UDP ephemeral
+		// port can belong to an excluded TCP range.
+		for range 10 {
+			listener, err = net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			packet, err = net.ListenPacket("udp", listener.Addr().String())
+			if err == nil {
+				break
+			}
+			_ = listener.Close()
+		}
+	} else {
+		packet, err = net.ListenPacket("udp", "127.0.0.1:0")
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,10 +59,6 @@ func localDNS(t testing.TB, handler dns.HandlerFunc, tcp bool) endpoint {
 		}
 	})
 	if tcp {
-		listener, err := net.Listen("tcp", packet.LocalAddr().String())
-		if err != nil {
-			t.Fatal(err)
-		}
 		started := make(chan struct{})
 		stream := &dns.Server{Listener: listener, Handler: handler, NotifyStartedFunc: func() { close(started) }}
 		go func() {
@@ -74,7 +89,7 @@ func replyWith(w dns.ResponseWriter, m *dns.Msg, rcode int) {
 
 func testConfig(t testing.TB) config {
 	t.Helper()
-	c, err := parseConfig([]string{"--in", "-", "--domain", "example.test", "--qps", "1000000", "--tests", "4", "--timeout", "200ms"}, io.Discard)
+	c, err := parseConfig([]string{"--validation", "off", "--in", "-", "--domain", "example.test", "--qps", "1000000", "--tests", "4", "--timeout", "200ms"}, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +137,7 @@ func TestConfigValidation(t *testing.T) {
 			t.Errorf("accepted %v", args)
 		}
 	}
-	c, err := parseConfig([]string{"--in", "-", "--domain", "EXAMPLE.COM.", "--save-dns=false"}, io.Discard)
+	c, err := parseConfig([]string{"--validation", "off", "--in", "-", "--domain", "EXAMPLE.COM.", "--save-dns=false"}, io.Discard)
 	if err != nil || c.domain != "example.com." || c.format != "legacy-csv" {
 		t.Fatalf("%+v %v", c, err)
 	}
@@ -421,7 +436,7 @@ func TestRunExitCodesAndStdout(t *testing.T) {
 		t.Fatal(code)
 	}
 	server := localDNS(t, func(w dns.ResponseWriter, m *dns.Msg) { replyWith(w, m, dns.RcodeNameError) }, false)
-	args := []string{"--in", "-", "--out", "-", "--format", "json", "--tests", "2", "--precheck-tests", "0", "--qps", "1000000"}
+	args := []string{"--validation", "off", "--in", "-", "--out", "-", "--format", "json", "--tests", "2", "--precheck-tests", "0", "--qps", "1000000"}
 	out.Reset()
 	report.Reset()
 	if code := run(context.Background(), args, strings.NewReader(server.label), &out, &report); code != 0 {
@@ -449,7 +464,7 @@ func TestRunPreservesOutputOnCancellationAndErrors(t *testing.T) {
 	defer cancel()
 	done := make(chan int, 1)
 	go func() {
-		done <- run(ctx, []string{"--in", "-", "--out", target, "--precheck-tests", "0", "--tests", "1", "--timeout", "10s"}, strings.NewReader(server.label), io.Discard, io.Discard)
+		done <- run(ctx, []string{"--validation", "off", "--in", "-", "--out", target, "--precheck-tests", "0", "--tests", "1", "--timeout", "10s"}, strings.NewReader(server.label), io.Discard, io.Discard)
 	}()
 	<-received
 	cancel()
@@ -470,7 +485,7 @@ func TestRunPreservesOutputOnCancellationAndErrors(t *testing.T) {
 		t.Fatal("cancellation leaked temporary output")
 	}
 	// A bad destination must fail before any queries are scheduled.
-	code := run(context.Background(), []string{"--in", "-", "--out", filepath.Join(dir, "missing", "results.txt")}, strings.NewReader(server.label), io.Discard, io.Discard)
+	code := run(context.Background(), []string{"--validation", "off", "--in", "-", "--out", filepath.Join(dir, "missing", "results.txt")}, strings.NewReader(server.label), io.Discard, io.Discard)
 	if code != 1 {
 		t.Fatal(code)
 	}
@@ -487,7 +502,7 @@ func TestRunWritesEmptyExportWhenAllResolversFail(t *testing.T) {
 	if err := os.WriteFile(target, []byte("previous"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	code := run(context.Background(), []string{"--in", "-", "--out", target, "--format", "json", "--quiet", "--tests", "1", "--precheck-tests", "0"}, strings.NewReader(server.label), io.Discard, io.Discard)
+	code := run(context.Background(), []string{"--validation", "off", "--in", "-", "--out", target, "--format", "json", "--quiet", "--tests", "1", "--precheck-tests", "0"}, strings.NewReader(server.label), io.Discard, io.Discard)
 	if code != 1 {
 		t.Fatal(code)
 	}
@@ -571,7 +586,7 @@ func BenchmarkLocalResolver(b *testing.B) {
 	samples := make([]float64, 0, c.tests)
 	b.ReportAllocs()
 	for b.Loop() {
-		r := checkResolver(context.Background(), c, server, names, &client, samples)
+		r := checkResolver(context.Background(), c, server, names, &client, samples, validationPlan{})
 		if r.Successes != c.tests {
 			b.Fatal(r)
 		}
@@ -601,7 +616,7 @@ func BenchmarkPrecheckBudget(b *testing.B) {
 			samples := make([]float64, 0, c.tests)
 			b.ReportAllocs()
 			for b.Loop() {
-				r := checkResolver(context.Background(), c, server, names, &client, samples)
+				r := checkResolver(context.Background(), c, server, names, &client, samples, validationPlan{})
 				if r.Successes != c.tests {
 					b.Fatal(r)
 				}

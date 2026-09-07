@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -27,14 +28,25 @@ type config struct {
 	timeout                                              time.Duration
 	maxTime, minRate, qps                                float64
 	tcpFallback, quiet, includeFiltered                  bool
+	validation, excludeFile, queryPrefix                 string
+	resolverInputs, exclusions, baselineInputs           []string
+	positiveDomains, negativeDomains, expectedInputs     []string
+	baselines                                            []endpoint
+	quorum, top                                          int
+	maxP95                                               float64
+	maxDuration                                          time.Duration
+	progress, verbose, showVersion                       bool
 }
 
 func parseConfig(args []string, stderr io.Writer) (config, error) {
 	var c config
-	var saveDNS, showVersion bool
+	var saveDNS bool
 	fs := flag.NewFlagSet("dnsfaster", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	fs.StringVar(&c.input, "in", "", "Resolver file, or - for stdin (required)")
+	fs.StringVar(&c.input, "in", "", "Resolver file, HTTP(S) URL, or - for stdin")
+	fs.StringSliceVar(&c.resolverInputs, "resolver", nil, "Resolver endpoints (repeatable or comma-separated)")
+	fs.StringSliceVar(&c.exclusions, "exclude", nil, "Exclude hosts, endpoints or CIDRs (repeatable)")
+	fs.StringVar(&c.excludeFile, "exclude-file", "", "Exclusion file or HTTP(S) URL")
 	fs.StringVar(&c.output, "out", "", "Output file, or - for stdout")
 	fs.StringVar(&c.domain, "domain", "example.com", "Base domain without wildcard DNS")
 	fs.IntVar(&c.workers, "workers", 10, "Concurrent resolver checks (1-251)")
@@ -44,27 +56,38 @@ func parseConfig(args []string, stderr io.Writer) (config, error) {
 	fs.IntVar(&c.prechecks, "precheck-tests", 3, "Base-domain checks per resolver (0 disables, maximum 1000)")
 	fs.IntVar(&c.precheckErrors, "precheck-errors", 1, "Allowed failures during prechecks")
 	fs.Float64Var(&c.maxTime, "filter-time", 0, "Maximum mean latency in milliseconds (0 disables)")
+	fs.Float64Var(&c.maxP95, "filter-p95", 0, "Maximum p95 latency in milliseconds (0 disables)")
 	fs.IntVar(&c.maxErrors, "filter-errors", 0, "Maximum measurement failures (0 disables)")
 	fs.Float64Var(&c.minRate, "filter-rate", 0, "Minimum success percentage (0 disables)")
 	fs.BoolVar(&c.tcpFallback, "tcp-fallback", false, "Retry truncated UDP responses over TCP")
 	fs.BoolVar(&c.quiet, "quiet", false, "Suppress the console report")
+	fs.BoolVar(&c.progress, "progress", true, "Show periodic progress on stderr")
+	fs.BoolVar(&c.verbose, "verbose", false, "Report each completed resolver on stderr")
+	fs.IntVar(&c.top, "top", 0, "Export at most this many passing resolvers after sorting (0 means all)")
+	fs.DurationVar(&c.maxDuration, "max-duration", 0, "Maximum duration for the entire run (0 disables)")
+	fs.StringVar(&c.validation, "validation", "baseline", "Correctness validation: baseline, expected or off")
+	fs.StringSliceVar(&c.baselineInputs, "baseline", []string{"1.1.1.1", "8.8.8.8", "9.9.9.9"}, "Trusted reference resolvers (repeatable or comma-separated)")
+	fs.IntVar(&c.quorum, "baseline-quorum", 0, "Required matching references (0 selects a strict majority)")
+	fs.StringSliceVar(&c.positiveDomains, "positive-domain", nil, "Additional positive-validation domains (repeatable)")
+	fs.StringSliceVar(&c.negativeDomains, "negative-domain", nil, "Negative-check domains; replaces defaults, root is always included")
+	fs.StringArrayVar(&c.expectedInputs, "expect", nil, "Expected A answers: domain=IPv4,IPv4 (repeatable)")
+	fs.StringVar(&c.queryPrefix, "query-prefix", "", "Optional prefix for random DNS query labels")
 	fs.BoolVar(&c.includeFiltered, "include-filtered", false, "Include rejected resolvers in CSV or JSON exports")
 	fs.BoolVar(&saveDNS, "save-dns", true, "Legacy output selector; false writes headerless CSV")
 	fs.StringVar(&c.format, "format", "", "Output format: dns, csv or json (default dns)")
-	fs.StringVar(&c.sortBy, "sort", "latency", "Sort by latency, rate or input")
-	fs.BoolVar(&showVersion, "version", false, "Print version and exit")
+	fs.StringVar(&c.sortBy, "sort", "latency", "Sort by latency, p95, rate or input")
+	fs.BoolVar(&c.showVersion, "version", false, "Print version and exit")
 	if err := fs.Parse(args); err != nil {
 		return c, err
 	}
-	if showVersion {
-		fmt.Fprintln(stderr, version)
-		return c, flag.ErrHelp
+	if c.showVersion {
+		return c, nil
 	}
 	if fs.NArg() != 0 {
 		return c, errors.New("unexpected positional arguments")
 	}
-	if c.input == "" {
-		return c, errors.New("--in is required (use --in - for stdin)")
+	if c.input == "" && len(c.resolverInputs) == 0 {
+		return c, errors.New("--in or --resolver is required (use --in - for stdin)")
 	}
 	if c.workers < 1 || c.workers > 251 {
 		return c, errors.New("--workers must be between 1 and 251")
@@ -75,13 +98,16 @@ func parseConfig(args []string, stderr io.Writer) (config, error) {
 	if c.timeout <= 0 {
 		return c, errors.New("--timeout must be positive")
 	}
+	if c.top < 0 || c.maxDuration < 0 {
+		return c, errors.New("--top and --max-duration cannot be negative")
+	}
 	if !finite(c.qps) || c.qps <= 0 || c.qps > 1000000 {
 		return c, errors.New("--qps must be positive and at most 1000000")
 	}
 	if c.prechecks < 0 || c.prechecks > 1000 || c.precheckErrors < 0 {
 		return c, errors.New("invalid precheck limits")
 	}
-	if !finite(c.maxTime) || c.maxTime < 0 || c.maxErrors < 0 || !finite(c.minRate) || c.minRate < 0 || c.minRate > 100 {
+	if !finite(c.maxTime) || c.maxTime < 0 || !finite(c.maxP95) || c.maxP95 < 0 || c.maxErrors < 0 || !finite(c.minRate) || c.minRate < 0 || c.minRate > 100 {
 		return c, errors.New("invalid filter thresholds")
 	}
 	c.domain = dns.Fqdn(strings.ToLower(strings.TrimSpace(c.domain)))
@@ -105,11 +131,44 @@ func parseConfig(args []string, stderr io.Writer) (config, error) {
 		return c, errors.New("--include-filtered requires --format csv or json")
 	}
 	switch c.sortBy {
-	case "latency", "rate", "input":
+	case "latency", "p95", "rate", "input":
 	default:
-		return c, errors.New("--sort must be latency, rate or input")
+		return c, errors.New("--sort must be latency, p95, rate or input")
+	}
+	if !fs.Changed("negative-domain") {
+		c.negativeDomains = []string{"facebook.com", "paypal.com", "google.com", "bet365.com", "wikileaks.com"}
+	}
+	if err := configureValidation(&c); err != nil {
+		return c, err
 	}
 	return c, nil
+}
+
+func buildVersion(info *debug.BuildInfo) string {
+	if version != "dev" {
+		return version
+	}
+	if info != nil {
+		if info.Main.Version != "" && info.Main.Version != "(devel)" {
+			return info.Main.Version
+		}
+		revision, dirty := "", false
+		for _, setting := range info.Settings {
+			if setting.Key == "vcs.revision" {
+				revision = setting.Value
+			}
+			if setting.Key == "vcs.modified" {
+				dirty = setting.Value == "true"
+			}
+		}
+		if revision != "" {
+			if dirty {
+				revision += "+dirty"
+			}
+			return revision
+		}
+	}
+	return "dev"
 }
 
 func finite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
@@ -210,59 +269,83 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		fmt.Fprintln(stderr, "dnsfaster:", err)
 		return 2
 	}
-	input := stdin
-	if c.input != "-" {
-		f, err := os.Open(c.input)
-		if err != nil {
-			fmt.Fprintln(stderr, "dnsfaster:", err)
-			return 1
+	if c.showVersion {
+		info, _ := debug.ReadBuildInfo()
+		if _, err := fmt.Fprintln(stdout, buildVersion(info)); err != nil {
+			return failRun(stderr, err)
 		}
-		defer f.Close()
-		input = f
+		return 0
 	}
-	servers, err := readResolvers(input)
+	started := time.Now()
+	if c.maxDuration > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.maxDuration)
+		defer cancel()
+	}
+	servers, excluded, err := loadResolvers(ctx, c, stdin)
 	if err != nil {
-		fmt.Fprintln(stderr, "dnsfaster:", err)
-		return 1
+		if ctx.Err() != nil {
+			err = ctx.Err()
+		}
+		return failRun(stderr, err)
 	}
 	// Reserve the temporary output before generating network traffic.
 	var output *outputFile
 	if c.output != "" && c.output != "-" {
-		output, err = prepareOutput(c.output, c.input)
+		if c.excludeFile != "" && !isRemoteSource(c.excludeFile) {
+			a, ea := os.Stat(c.excludeFile)
+			b, eb := os.Stat(c.output)
+			if ea == nil && eb == nil && os.SameFile(a, b) {
+				return failRun(stderr, errors.New("output must not overwrite the exclusion file"))
+			}
+		}
+		inputPath := c.input
+		if inputPath == "" || isRemoteSource(inputPath) {
+			inputPath = "-"
+		}
+		output, err = prepareOutput(c.output, inputPath)
 		if err != nil {
-			fmt.Fprintln(stderr, "dnsfaster:", err)
-			return 1
+			return failRun(stderr, err)
 		}
 		defer output.abort()
 	}
-	results, err := measure(ctx, c, servers)
-	if err != nil {
-		fmt.Fprintln(stderr, "dnsfaster:", err)
-		if errors.Is(err, context.Canceled) {
-			return 130
+	var progress *progressReporter
+	if !c.quiet {
+		progress = &progressReporter{writer: stderr, started: started, enabled: c.progress, verbose: c.verbose, total: len(servers)}
+		if err := progress.phase("starting " + c.validation + " validation"); err != nil {
+			return failRun(stderr, err)
 		}
-		return 1
+	}
+	results, err := measureWithProgress(ctx, c, servers, progress)
+	if err != nil {
+		return failRun(stderr, err)
 	}
 	sortResults(results, c.sortBy)
 	if !c.quiet {
 		if err := writeReport(stderr, results); err != nil {
-			fmt.Fprintln(stderr, "dnsfaster:", err)
-			return 1
+			return failRun(stderr, err)
 		}
+		if err := writeSummary(stderr, results, excluded, c.top, started); err != nil {
+			return failRun(stderr, err)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return failRun(stderr, err)
 	}
 	if c.output != "" {
 		var dest io.Writer = stdout
 		if output != nil {
 			dest = output.file
 		}
-		if err := writeResults(dest, results, c.format, c.includeFiltered); err != nil {
-			fmt.Fprintln(stderr, "dnsfaster:", err)
-			return 1
+		if err := writeResults(dest, selectExports(results, c.top, c.includeFiltered), c.format, c.includeFiltered); err != nil {
+			return failRun(stderr, err)
 		}
 		if output != nil {
+			if err := ctx.Err(); err != nil {
+				return failRun(stderr, err)
+			}
 			if err := output.commit(); err != nil {
-				fmt.Fprintln(stderr, "dnsfaster:", err)
-				return 1
+				return failRun(stderr, err)
 			}
 		}
 	}
@@ -270,6 +353,14 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		if !r.Filtered {
 			return 0
 		}
+	}
+	return 1
+}
+
+func failRun(stderr io.Writer, err error) int {
+	fmt.Fprintln(stderr, "dnsfaster:", err)
+	if errors.Is(err, context.Canceled) {
+		return 130
 	}
 	return 1
 }
