@@ -36,6 +36,8 @@ type config struct {
 	maxP95                                               float64
 	maxDuration                                          time.Duration
 	progress, verbose, showVersion                       bool
+	recordTypes                                          []string
+	validationRetries                                    int
 }
 
 func parseConfig(args []string, stderr io.Writer) (config, error) {
@@ -53,7 +55,7 @@ func parseConfig(args []string, stderr io.Writer) (config, error) {
 	fs.IntVar(&c.tests, "tests", 10, "Measurements per resolver (1-5000)")
 	fs.DurationVar(&c.timeout, "timeout", 2*time.Second, "Timeout per query, including TCP fallback")
 	fs.Float64Var(&c.qps, "qps", 50, "Global query rate limit, including prechecks and TCP retries")
-	fs.IntVar(&c.prechecks, "precheck-tests", 3, "Base-domain checks per resolver (0 disables, maximum 1000)")
+	fs.IntVar(&c.prechecks, "precheck-tests", 3, "Extra base-domain checks (default 0 with validation, 3 when off; maximum 1000)")
 	fs.IntVar(&c.precheckErrors, "precheck-errors", 1, "Allowed failures during prechecks")
 	fs.Float64Var(&c.maxTime, "filter-time", 0, "Maximum mean latency in milliseconds (0 disables)")
 	fs.Float64Var(&c.maxP95, "filter-p95", 0, "Maximum p95 latency in milliseconds (0 disables)")
@@ -66,11 +68,13 @@ func parseConfig(args []string, stderr io.Writer) (config, error) {
 	fs.IntVar(&c.top, "top", 0, "Export at most this many passing resolvers after sorting (0 means all)")
 	fs.DurationVar(&c.maxDuration, "max-duration", 0, "Maximum duration for the entire run (0 disables)")
 	fs.StringVar(&c.validation, "validation", "baseline", "Correctness validation: baseline, expected or off")
+	fs.IntVar(&c.validationRetries, "validation-retries", 1, "Extra attempts for validation timeout/transport failures (0-3)")
+	fs.StringSliceVar(&c.recordTypes, "record-types", []string{"A"}, "Correctness record types: A, AAAA or A,AAAA; measurements remain A")
 	fs.StringSliceVar(&c.baselineInputs, "baseline", []string{"1.1.1.1", "8.8.8.8", "9.9.9.9"}, "Trusted reference resolvers (repeatable or comma-separated)")
 	fs.IntVar(&c.quorum, "baseline-quorum", 0, "Required matching references (0 selects a strict majority)")
 	fs.StringSliceVar(&c.positiveDomains, "positive-domain", nil, "Additional positive-validation domains (repeatable)")
 	fs.StringSliceVar(&c.negativeDomains, "negative-domain", nil, "Negative-check domains; replaces defaults, root is always included")
-	fs.StringArrayVar(&c.expectedInputs, "expect", nil, "Expected A answers: domain=IPv4,IPv4 (repeatable)")
+	fs.StringArrayVar(&c.expectedInputs, "expect", nil, "Expected addresses: domain=IP,IP (repeatable; family selects A or AAAA)")
 	fs.StringVar(&c.queryPrefix, "query-prefix", "", "Optional prefix for random DNS query labels")
 	fs.BoolVar(&c.includeFiltered, "include-filtered", false, "Include rejected resolvers in CSV or JSON exports")
 	fs.BoolVar(&saveDNS, "save-dns", true, "Legacy output selector; false writes headerless CSV")
@@ -82,6 +86,9 @@ func parseConfig(args []string, stderr io.Writer) (config, error) {
 	}
 	if c.showVersion {
 		return c, nil
+	}
+	if !fs.Changed("precheck-tests") && c.validation != "off" {
+		c.prechecks = 0
 	}
 	if fs.NArg() != 0 {
 		return c, errors.New("unexpected positional arguments")

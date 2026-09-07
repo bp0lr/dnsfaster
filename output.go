@@ -97,7 +97,7 @@ func writeResults(dest io.Writer, results []resultStats, format string, includeF
 	if format == "csv" || format == "legacy-csv" {
 		w := csv.NewWriter(dest)
 		if format == "csv" {
-			if err := w.Write([]string{"resolver", "average_ms", "success_percent", "successes", "failures", "p50_ms", "p95_ms", "precheck_failures", "filtered", "reasons", "errors", "validation_checks", "validation_failures"}); err != nil {
+			if err := w.Write([]string{"resolver", "average_ms", "success_percent", "successes", "failures", "p50_ms", "p95_ms", "precheck_failures", "filtered", "reasons", "errors", "validation_checks", "validation_failures", "validation_retries"}); err != nil {
 				return err
 			}
 		}
@@ -109,7 +109,7 @@ func writeResults(dest io.Writer, results []resultStats, format string, includeF
 					return err
 				}
 				row = append(row, decimal(r.P50MS), decimal(r.P95MS), strconv.Itoa(r.PrecheckFailures), strconv.FormatBool(r.Filtered), strings.Join(r.Reasons, ";"), string(details))
-				row = append(row, strconv.Itoa(r.ValidationChecks), strconv.Itoa(r.ValidationFailures))
+				row = append(row, strconv.Itoa(r.ValidationChecks), strconv.Itoa(r.ValidationFailures), strconv.Itoa(r.ValidationRetries))
 			}
 			if err := w.Write(row); err != nil {
 				return err

@@ -9,6 +9,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/miekg/dns"
 	"golang.org/x/time/rate"
@@ -16,14 +17,30 @@ import (
 
 type positiveCheck struct {
 	domain    string
+	qtype     uint16
 	addresses []string
 }
 type validationPlan struct {
 	positives []positiveCheck
 	negatives []string
+	qtypes    []uint16
 }
 
 func configureValidation(c *config) error {
+	if c.validationRetries < 0 || c.validationRetries > 3 {
+		return errors.New("--validation-retries must be between 0 and 3")
+	}
+	if len(c.recordTypes) == 0 {
+		return errors.New("--record-types requires A, AAAA or both")
+	}
+	for i, value := range c.recordTypes {
+		c.recordTypes[i] = strings.ToUpper(strings.TrimSpace(value))
+		if c.recordTypes[i] != "A" && c.recordTypes[i] != "AAAA" {
+			return errors.New("--record-types supports only A and AAAA")
+		}
+	}
+	sort.Strings(c.recordTypes)
+	c.recordTypes = slices.Compact(c.recordTypes)
 	switch c.validation {
 	case "baseline", "expected", "off":
 	default:
@@ -51,9 +68,18 @@ func configureValidation(c *config) error {
 	if err != nil {
 		return err
 	}
-	for name := range expected {
+	for name, addresses := range expected {
 		if !slices.Contains(c.positiveDomains, name) {
 			return fmt.Errorf("--expect domain %s must be --domain or a --positive-domain", name)
+		}
+		for _, address := range addresses {
+			kind := "AAAA"
+			if netip.MustParseAddr(address).Is4() {
+				kind = "A"
+			}
+			if !slices.Contains(c.recordTypes, kind) {
+				return fmt.Errorf("--expect %s requires --record-types to include %s", address, kind)
+			}
 		}
 	}
 	if c.validation == "off" && len(expected) > 0 {
@@ -61,8 +87,10 @@ func configureValidation(c *config) error {
 	}
 	if c.validation == "expected" {
 		for _, name := range c.positiveDomains {
-			if len(expected[name]) == 0 {
-				return fmt.Errorf("--validation expected requires --expect for %s", name)
+			for _, kind := range c.recordTypes {
+				if len(addressesOfType(expected[name], dns.StringToType[kind])) == 0 {
+					return fmt.Errorf("--validation expected requires --expect %s answers for %s", kind, name)
+				}
 			}
 		}
 	}
@@ -119,7 +147,7 @@ func expectedAnswers(values []string) (map[string][]string, error) {
 	for _, value := range values {
 		name, addresses, ok := strings.Cut(value, "=")
 		if !ok {
-			return nil, errors.New("--expect must be domain=IPv4,IPv4")
+			return nil, errors.New("--expect must be domain=IP,IP")
 		}
 		names, err := normalizeDomains([]string{name}, 0)
 		if err != nil {
@@ -127,10 +155,10 @@ func expectedAnswers(values []string) (map[string][]string, error) {
 		}
 		for _, address := range strings.Split(addresses, ",") {
 			ip, err := netip.ParseAddr(strings.TrimSpace(address))
-			if err != nil || !ip.Unmap().Is4() {
-				return nil, fmt.Errorf("--expect requires IPv4 A answers: %q", address)
+			if err != nil || ip.Zone() != "" {
+				return nil, fmt.Errorf("--expect requires IPv4 or IPv6 addresses without a zone: %q", address)
 			}
-			expected[names[0]] = append(expected[names[0]], ip.Unmap().String())
+			expected[names[0]] = append(expected[names[0]], ip.String())
 		}
 	}
 	for name, answers := range expected {
@@ -138,6 +166,16 @@ func expectedAnswers(values []string) (map[string][]string, error) {
 		expected[name] = slices.Compact(answers)
 	}
 	return expected, nil
+}
+
+func addressesOfType(addresses []string, qtype uint16) []string {
+	var selected []string
+	for _, address := range addresses {
+		if netip.MustParseAddr(address).Is4() == (qtype == dns.TypeA) {
+			selected = append(selected, address)
+		}
+	}
+	return selected
 }
 
 func randomName(domain, prefix string) string {
@@ -149,7 +187,7 @@ func randomName(domain, prefix string) string {
 
 // Compare only addresses belonging to the question or its CNAME chain. TTL,
 // answer ordering and unrelated records do not change the expected answer set.
-func answerAddresses(reply *dns.Msg, name string) ([]string, string) {
+func answerAddresses(reply *dns.Msg, name string, qtype uint16) ([]string, string) {
 	aliases := make(map[string]string)
 	addresses := make(map[string][]string)
 	for _, record := range reply.Answer {
@@ -165,11 +203,23 @@ func answerAddresses(reply *dns.Msg, name string) ([]string, string) {
 			}
 			aliases[owner] = target
 		case *dns.A:
+			if qtype != dns.TypeA {
+				continue
+			}
 			ip, ok := netip.AddrFromSlice(rr.A)
 			if !ok || !ip.Unmap().Is4() {
 				return nil, "invalid_address"
 			}
 			addresses[owner] = append(addresses[owner], ip.Unmap().String())
+		case *dns.AAAA:
+			if qtype != dns.TypeAAAA {
+				continue
+			}
+			ip, ok := netip.AddrFromSlice(rr.AAAA)
+			if !ok || !ip.Is6() {
+				return nil, "invalid_address"
+			}
+			addresses[owner] = append(addresses[owner], ip.String())
 		}
 	}
 	owner := dns.CanonicalName(name)
@@ -197,19 +247,38 @@ func answerAddresses(reply *dns.Msg, name string) ([]string, string) {
 }
 
 func newQueryClient(c config, limiter *rate.Limiter) *queryClient {
-	return &queryClient{udp: dns.Client{Net: "udp", Timeout: c.timeout}, tcp: dns.Client{Net: "tcp", Timeout: c.timeout}, limiter: limiter, fallback: c.tcpFallback, timeout: c.timeout}
+	return &queryClient{udp: dns.Client{Net: "udp", Timeout: c.timeout}, tcp: dns.Client{Net: "tcp", Timeout: c.timeout}, limiter: limiter, fallback: c.tcpFallback, timeout: c.timeout, validationRetries: c.validationRetries}
+}
+
+// Retries are confined to correctness checks. Each attempt uses the shared
+// limiter and a fresh query timeout; the caller's overall deadline still applies.
+func (c *queryClient) validationLookup(ctx context.Context, msg *dns.Msg, address string, expected int) (*dns.Msg, string, int) {
+	for attempt := 0; ; attempt++ {
+		reply, _, reason := c.lookup(ctx, msg, address, expected)
+		if ctx.Err() != nil || attempt >= c.validationRetries || (reason != "timeout" && reason != "transport") {
+			return reply, reason, attempt
+		}
+		msg.Id = dns.Id()
+	}
 }
 
 type referenceQuestion struct {
 	name     string
+	qtype    uint16
 	positive bool
 }
-type referenceResult struct{ keys, reasons []string }
+type referenceResult struct {
+	question    int
+	key, reason string
+}
 
 func prepareValidation(ctx context.Context, c config, limiter *rate.Limiter) (validationPlan, error) {
 	plan := validationPlan{}
 	if c.validation == "off" {
 		return plan, nil
+	}
+	for _, kind := range c.recordTypes {
+		plan.qtypes = append(plan.qtypes, dns.StringToType[kind])
 	}
 	expected, err := expectedAnswers(c.expectedInputs)
 	if err != nil {
@@ -217,82 +286,109 @@ func prepareValidation(ctx context.Context, c config, limiter *rate.Limiter) (va
 	}
 	var questions []referenceQuestion
 	for _, name := range c.positiveDomains {
-		plan.positives = append(plan.positives, positiveCheck{domain: name, addresses: expected[name]})
-		if len(expected[name]) == 0 {
-			questions = append(questions, referenceQuestion{name: name, positive: true})
+		for _, qtype := range plan.qtypes {
+			addresses := addressesOfType(expected[name], qtype)
+			plan.positives = append(plan.positives, positiveCheck{domain: name, qtype: qtype, addresses: addresses})
+			if len(addresses) == 0 {
+				questions = append(questions, referenceQuestion{name: name, qtype: qtype, positive: true})
+			}
 		}
 	}
 	for _, domain := range c.negativeDomains {
 		name := randomName(domain, c.queryPrefix)
 		plan.negatives = append(plan.negatives, name)
 		if c.validation == "baseline" {
-			questions = append(questions, referenceQuestion{name: name})
+			for _, qtype := range plan.qtypes {
+				questions = append(questions, referenceQuestion{name: name, qtype: qtype})
+			}
 		}
 	}
 	if c.validation == "expected" {
 		return plan, nil
 	}
+	// Cancel only the reference phase; candidate workers keep the parent context.
+	refCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	results := make(chan referenceResult, len(c.baselines))
+	var wg sync.WaitGroup
 	for _, reference := range c.baselines {
+		wg.Add(1)
 		go func() {
-			result := referenceResult{keys: make([]string, len(questions)), reasons: make([]string, len(questions))}
+			defer wg.Done()
 			client := newQueryClient(c, limiter)
 			var msg dns.Msg
 			for i, q := range questions {
-				if ctx.Err() != nil {
-					result.reasons[i] = "canceled"
-					continue
+				if refCtx.Err() != nil {
+					return
 				}
-				msg.SetQuestion(q.name, dns.TypeA)
+				msg.SetQuestion(q.name, q.qtype)
 				code := dns.RcodeNameError
 				if q.positive {
 					code = dns.RcodeSuccess
 				}
-				reply, _, reason := client.lookup(ctx, &msg, reference.address, code)
-				if reason == "" {
-					if q.positive {
-						var answers []string
-						answers, reason = answerAddresses(reply, q.name)
-						result.keys[i] = strings.Join(answers, ",")
-					} else {
-						result.keys[i] = "NXDOMAIN"
-					}
+				reply, reason, _ := client.validationLookup(refCtx, &msg, reference.address, code)
+				key := "NXDOMAIN"
+				if reason == "" && q.positive {
+					var answers []string
+					answers, reason = answerAddresses(reply, q.name, q.qtype)
+					key = strings.Join(answers, ",")
 				}
-				result.reasons[i] = reason
+				select {
+				case results <- referenceResult{question: i, key: key, reason: reason}:
+				case <-refCtx.Done():
+					return
+				}
 			}
-			results <- result
 		}()
 	}
+	go func() { wg.Wait(); close(results) }()
 	votes := make([]map[string]int, len(questions))
+	received := make([]int, len(questions))
+	consensus := make([]string, len(questions))
 	for i := range votes {
 		votes[i] = make(map[string]int)
 	}
-	for range c.baselines {
-		result := <-results
-		for i, key := range result.keys {
-			if result.reasons[i] == "" {
-				votes[i][key]++
+	resolved := 0
+	var quorumErr error
+	for result := range results {
+		i := result.question
+		if quorumErr != nil || consensus[i] != "" {
+			continue
+		}
+		received[i]++
+		if result.reason == "" {
+			votes[i][result.key]++
+			if votes[i][result.key] >= c.quorum {
+				consensus[i] = result.key
+				resolved++
+				if resolved == len(questions) {
+					cancel()
+				}
+				continue
 			}
 		}
+		best := 0
+		for _, count := range votes[i] {
+			best = max(best, count)
+		}
+		if best+len(c.baselines)-received[i] < c.quorum {
+			q := questions[i]
+			quorumErr = fmt.Errorf("no reference quorum for %s/%s: need %d of %d matching responses; choose stable domains or explicit expected answers", q.name, dns.TypeToString[q.qtype], c.quorum, len(c.baselines))
+			cancel()
+		}
 	}
+	// Draining the channel joins all reference workers before candidates start.
 	if err := ctx.Err(); err != nil {
 		return plan, err
 	}
+	if quorumErr != nil {
+		return plan, quorumErr
+	}
 	for i, q := range questions {
-		consensus := ""
-		for key, count := range votes[i] {
-			if count >= c.quorum {
-				consensus = key
-				break
-			}
-		}
-		if consensus == "" {
-			return plan, fmt.Errorf("no reference quorum for %s: need %d of %d matching responses; choose stable domains or explicit expected answers", q.name, c.quorum, len(c.baselines))
-		}
 		if q.positive {
 			for j := range plan.positives {
-				if plan.positives[j].domain == q.name {
-					plan.positives[j].addresses = strings.Split(consensus, ",")
+				if plan.positives[j].domain == q.name && plan.positives[j].qtype == q.qtype {
+					plan.positives[j].addresses = strings.Split(consensus[i], ",")
 					break
 				}
 			}
@@ -303,41 +399,45 @@ func prepareValidation(ctx context.Context, c config, limiter *rate.Limiter) (va
 
 func validateResolver(ctx context.Context, plan validationPlan, server endpoint, client *queryClient, r *resultStats) {
 	var msg dns.Msg
-	reject := func(reason, name string) {
+	reject := func(reason, name string, qtype uint16) {
 		r.ValidationFailures++
 		r.Errors["validation_"+reason]++
-		r.Reasons = append(r.Reasons, reason+":"+name)
+		r.Reasons = append(r.Reasons, reason+":"+name+"/"+dns.TypeToString[qtype])
 		r.Filtered = true
 	}
 	for _, check := range plan.positives {
 		if ctx.Err() != nil {
 			return
 		}
-		msg.SetQuestion(check.domain, dns.TypeA)
-		reply, _, reason := client.lookup(ctx, &msg, server.address, dns.RcodeSuccess)
+		msg.SetQuestion(check.domain, check.qtype)
+		reply, reason, retries := client.validationLookup(ctx, &msg, server.address, dns.RcodeSuccess)
 		r.ValidationChecks++
+		r.ValidationRetries += retries
 		if reason == "" {
 			var addresses []string
-			addresses, reason = answerAddresses(reply, check.domain)
+			addresses, reason = answerAddresses(reply, check.domain, check.qtype)
 			if reason == "" && !slices.Equal(addresses, check.addresses) {
 				reason = "positive_mismatch"
 			}
 		}
 		if reason != "" {
-			reject(reason, check.domain)
+			reject(reason, check.domain, check.qtype)
 			return
 		}
 	}
 	for _, name := range plan.negatives {
-		if ctx.Err() != nil {
-			return
-		}
-		msg.SetQuestion(name, dns.TypeA)
-		_, reason := client.query(ctx, &msg, server.address, dns.RcodeNameError)
-		r.ValidationChecks++
-		if reason != "" {
-			reject("negative_"+reason, name)
-			return
+		for _, qtype := range plan.qtypes {
+			if ctx.Err() != nil {
+				return
+			}
+			msg.SetQuestion(name, qtype)
+			_, reason, retries := client.validationLookup(ctx, &msg, server.address, dns.RcodeNameError)
+			r.ValidationChecks++
+			r.ValidationRetries += retries
+			if reason != "" {
+				reject("negative_"+reason, name, qtype)
+				return
+			}
 		}
 	}
 }

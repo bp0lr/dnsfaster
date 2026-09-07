@@ -78,7 +78,7 @@ func TestReferenceQuorumAndCandidateValidation(t *testing.T) {
 	}
 	// Two positive domains and two negative names are checked once per reference,
 	// regardless of candidate count. Negative measurement names are separate.
-	if referenceCalls.Load() != 12 {
+	if referenceCalls.Load() < 8 || referenceCalls.Load() > 12 {
 		t.Fatalf("reference queries=%d", referenceCalls.Load())
 	}
 	if candidateCalls.Load() != 19 {
@@ -160,7 +160,7 @@ func TestAnswerAddresses(t *testing.T) {
 		}
 		return r
 	}
-	answer, reason := answerAddresses(parse("EXAMPLE.TEST. 10 IN CNAME Alias.test.", "alias.test. 20 IN A 192.0.2.2", "alias.test. 90 IN A 192.0.2.1", "alias.test. 90 IN A 192.0.2.1", "unrelated.test. 1 IN A 192.0.2.99"), "example.test.")
+	answer, reason := answerAddresses(parse("EXAMPLE.TEST. 10 IN CNAME Alias.test.", "alias.test. 20 IN A 192.0.2.2", "alias.test. 90 IN A 192.0.2.1", "alias.test. 90 IN A 192.0.2.1", "unrelated.test. 1 IN A 192.0.2.99"), "example.test.", dns.TypeA)
 	if reason != "" || strings.Join(answer, ",") != "192.0.2.1,192.0.2.2" {
 		t.Fatalf("%v %s", answer, reason)
 	}
@@ -173,7 +173,7 @@ func TestAnswerAddresses(t *testing.T) {
 		{[]string{"example.test. 1 IN CNAME alias.test.", "alias.test. 1 IN CNAME example.test."}, "cname_loop"},
 		{[]string{"example.test. 1 IN CNAME alias.test.", "example.test. 1 IN A 192.0.2.1"}, "invalid_cname"},
 	} {
-		_, reason := answerAddresses(parse(tc.records...), "example.test.")
+		_, reason := answerAddresses(parse(tc.records...), "example.test.", dns.TypeA)
 		if reason != tc.want {
 			t.Fatalf("%s want %s", reason, tc.want)
 		}
@@ -434,4 +434,268 @@ func BenchmarkValidatedResolver(b *testing.B) {
 		}
 	}
 	b.ReportMetric(5, "queries/op")
+}
+
+func TestAdaptivePrechecks(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want int
+	}{
+		{nil, 0},
+		{[]string{"--validation", "off"}, 3},
+		{[]string{"--validation", "expected", "--expect", "example.com=192.0.2.1"}, 0},
+		{[]string{"--precheck-tests", "4"}, 4},
+		{[]string{"--validation", "off", "--precheck-tests", "0"}, 0},
+	} {
+		c, err := parseConfig(append([]string{"--resolver", "127.0.0.1"}, tc.args...), io.Discard)
+		if err != nil || c.prechecks != tc.want {
+			t.Fatalf("%v: prechecks=%d err=%v", tc.args, c.prechecks, err)
+		}
+	}
+}
+
+func TestReferenceQuorumCancelsSilentMinority(t *testing.T) {
+	silentStarted := make(chan struct{}, 1)
+	silent := localDNS(t, func(w dns.ResponseWriter, m *dns.Msg) {
+		select {
+		case silentStarted <- struct{}{}:
+		default:
+		}
+	}, false)
+	goodHandler := func(w dns.ResponseWriter, m *dns.Msg) {
+		select {
+		case <-silentStarted:
+			silentStarted <- struct{}{}
+		case <-time.After(time.Second):
+		}
+		if m.Question[0].Name == "example.test." {
+			replyAddresses(w, m, "192.0.2.1")
+		} else {
+			replyWith(w, m, dns.RcodeNameError)
+		}
+	}
+	a := localDNS(t, goodHandler, false)
+	b := localDNS(t, goodHandler, false)
+	candidate := referenceServer(t, []string{"192.0.2.1"}, nil)
+	cfg := validationConfig(t, "--baseline", silent.label+","+a.label+","+b.label, "--timeout", "10s")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	results, err := measure(ctx, cfg, []endpoint{candidate})
+	if err != nil || len(results) != 1 || results[0].Filtered || results[0].Successes != 2 {
+		t.Fatalf("results=%+v err=%v", results, err)
+	}
+}
+
+func TestValidationRetriesAndMeasurementIsolation(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		retries   int
+		drop      int64
+		wantPass  bool
+		wantCalls int64
+	}{
+		{"recover", 1, 1, true, 2}, {"disabled", 0, 1, false, 1}, {"bounded", 2, 100, false, 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var positiveCalls atomic.Int64
+			server := localDNS(t, func(w dns.ResponseWriter, m *dns.Msg) {
+				if m.Question[0].Name == "example.test." {
+					if positiveCalls.Add(1) <= tc.drop {
+						return
+					}
+					replyAddresses(w, m, "192.0.2.1")
+				} else {
+					replyWith(w, m, dns.RcodeNameError)
+				}
+			}, false)
+			cfg := validationConfig(t, "--validation", "expected", "--expect", "example.test=192.0.2.1", "--validation-retries", fmt.Sprint(tc.retries), "--timeout", "30ms")
+			results, err := measure(context.Background(), cfg, []endpoint{server})
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := results[0]
+			if r.Filtered == tc.wantPass || positiveCalls.Load() != tc.wantCalls || r.ValidationRetries != int(tc.wantCalls)-1 {
+				t.Fatalf("%+v calls=%d", r, positiveCalls.Load())
+			}
+		})
+	}
+	var calls atomic.Int64
+	silent := localDNS(t, func(w dns.ResponseWriter, m *dns.Msg) { calls.Add(1) }, false)
+	cfg := validationConfig(t, "--validation", "off", "--validation-retries", "3", "--timeout", "30ms")
+	results, err := measure(context.Background(), cfg, []endpoint{silent})
+	if err != nil || calls.Load() != 2 || results[0].Failures != 2 || results[0].ValidationRetries != 0 {
+		t.Fatalf("%+v calls=%d err=%v", results, calls.Load(), err)
+	}
+}
+
+func TestValidationDoesNotRetryBadAnswers(t *testing.T) {
+	for _, code := range []int{dns.RcodeSuccess, dns.RcodeServerFailure, dns.RcodeRefused} {
+		var calls atomic.Int64
+		server := localDNS(t, func(w dns.ResponseWriter, m *dns.Msg) {
+			calls.Add(1)
+			if code == dns.RcodeSuccess {
+				replyAddresses(w, m, "192.0.2.99")
+			} else {
+				replyWith(w, m, code)
+			}
+		}, false)
+		cfg := validationConfig(t, "--validation", "expected", "--expect", "example.test=192.0.2.1", "--validation-retries", "3")
+		results, err := measure(context.Background(), cfg, []endpoint{server})
+		if err != nil || !results[0].Filtered || calls.Load() != 1 || results[0].ValidationRetries != 0 {
+			t.Fatalf("%+v calls=%d err=%v", results, calls.Load(), err)
+		}
+	}
+}
+
+func TestReferenceRetries(t *testing.T) {
+	var calls atomic.Int64
+	server := localDNS(t, func(w dns.ResponseWriter, m *dns.Msg) {
+		if calls.Add(1) == 1 {
+			return
+		}
+		if m.Question[0].Name == "example.test." {
+			replyAddresses(w, m, "192.0.2.1")
+		} else {
+			replyWith(w, m, dns.RcodeNameError)
+		}
+	}, false)
+	cfg := validationConfig(t, "--baseline", server.label, "--timeout", "30ms")
+	_, err := prepareValidation(context.Background(), cfg, rate.NewLimiter(rate.Inf, 1))
+	if err != nil || calls.Load() != 4 {
+		t.Fatalf("calls=%d err=%v", calls.Load(), err)
+	}
+}
+
+func TestDualStackValidation(t *testing.T) {
+	serverFor := func(badAAAA, badNegative bool) endpoint {
+		return localDNS(t, func(w dns.ResponseWriter, m *dns.Msg) {
+			q := m.Question[0]
+			if q.Name != "example.test." {
+				if badNegative && q.Qtype == dns.TypeAAAA {
+					replyWith(w, m, dns.RcodeSuccess)
+				} else {
+					replyWith(w, m, dns.RcodeNameError)
+				}
+				return
+			}
+			if q.Qtype == dns.TypeA {
+				replyAddresses(w, m, "192.0.2.1")
+				return
+			}
+			r := new(dns.Msg)
+			r.SetReply(m)
+			address := "2001:db8::1"
+			if badAAAA {
+				address = "2001:db8::99"
+			}
+			for _, text := range []string{"example.test. 60 IN CNAME alias.test.", "alias.test. 10 IN AAAA " + address, "unrelated.test. 50 IN AAAA 2001:db8::ffff"} {
+				rr, err := dns.NewRR(text)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				r.Answer = append(r.Answer, rr)
+			}
+			_ = w.WriteMsg(r)
+		}, false)
+	}
+	good, bad, badNegative := serverFor(false, false), serverFor(true, false), serverFor(false, true)
+	for _, mode := range []string{"baseline", "expected"} {
+		args := []string{"--record-types", "AAAA,a,AAAA", "--validation", mode, "--baseline", good.label}
+		if mode == "expected" {
+			args = append(args, "--expect", "example.test=192.0.2.1,2001:0db8:0::1")
+		}
+		cfg := validationConfig(t, args...)
+		results, err := measure(context.Background(), cfg, []endpoint{good, bad, badNegative})
+		if err != nil {
+			t.Fatal(err)
+		}
+		sortResults(results, "input")
+		if results[0].Filtered || results[0].ValidationChecks != 6 || !results[1].Filtered || !results[2].Filtered {
+			t.Fatalf("%s: %+v", mode, results)
+		}
+		if !strings.Contains(results[1].Reasons[0], "/AAAA") || results[1].ValidationRetries != 0 {
+			t.Fatal(results[1])
+		}
+	}
+	cfg := validationConfig(t, "--record-types", "AAAA", "--validation", "expected", "--expect", "example.test=2001:db8::1")
+	results, err := measure(context.Background(), cfg, []endpoint{good})
+	if err != nil || results[0].Filtered || results[0].ValidationChecks != 3 {
+		t.Fatalf("%+v %v", results, err)
+	}
+}
+
+func TestNewValidationArguments(t *testing.T) {
+	for _, args := range [][]string{
+		{"--record-types", ""}, {"--record-types", "TXT"}, {"--validation-retries", "4"}, {"--validation-retries", "-1"},
+		{"--record-types", "A,AAAA", "--validation", "expected", "--expect", "example.com=192.0.2.1"},
+		{"--record-types", "AAAA", "--expect", "example.com=fe80::1%eth0"},
+	} {
+		if _, err := parseConfig(append([]string{"--resolver", "127.0.0.1"}, args...), io.Discard); err == nil {
+			t.Fatalf("accepted %v", args)
+		}
+	}
+}
+
+func TestReferenceImpossibleQuorumStopsEarly(t *testing.T) {
+	a := referenceServer(t, []string{"192.0.2.1"}, nil)
+	b := referenceServer(t, []string{"192.0.2.2"}, nil)
+	silent := localDNS(t, func(w dns.ResponseWriter, m *dns.Msg) {}, false)
+	cfg := validationConfig(t, "--baseline", a.label+","+b.label+","+silent.label, "--baseline-quorum", "3", "--timeout", "10s")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err := prepareValidation(ctx, cfg, rate.NewLimiter(rate.Inf, 1))
+	if err == nil || !strings.Contains(err.Error(), "quorum") || ctx.Err() != nil {
+		t.Fatalf("err=%v ctx=%v", err, ctx.Err())
+	}
+}
+
+func TestValidationRetryRateAndDeadline(t *testing.T) {
+	var calls atomic.Int64
+	silent := localDNS(t, func(w dns.ResponseWriter, m *dns.Msg) { calls.Add(1) }, false)
+	cfg := validationConfig(t, "--validation", "expected", "--expect", "example.test=192.0.2.1", "--validation-retries", "3", "--timeout", "20ms")
+	client := newQueryClient(cfg, rate.NewLimiter(10, 1))
+	var msg dns.Msg
+	msg.SetQuestion("example.test.", dns.TypeA)
+	ctx, cancel := context.WithTimeout(context.Background(), 160*time.Millisecond)
+	defer cancel()
+	_, reason, _ := client.validationLookup(ctx, &msg, silent.address, dns.RcodeSuccess)
+	if reason != "canceled" || ctx.Err() == nil || calls.Load() > 2 {
+		t.Fatalf("reason=%s calls=%d ctx=%v", reason, calls.Load(), ctx.Err())
+	}
+}
+
+func TestAAAAAddressSets(t *testing.T) {
+	for _, tc := range []struct {
+		records      []string
+		want, reason string
+	}{
+		{[]string{"example.test. 10 IN AAAA 2001:0db8:0::1", "example.test. 60 IN AAAA 2001:db8::1", "example.test. 10 IN A 192.0.2.1"}, "2001:db8::1", ""},
+		{[]string{"example.test. 10 IN AAAA ::ffff:192.0.2.1"}, "::ffff:192.0.2.1", ""},
+		{[]string{"example.test. 10 IN A 192.0.2.1"}, "", "no_address_answers"},
+		{[]string{"example.test. 10 IN CNAME alias.test.", "example.test. 10 IN AAAA 2001:db8::1"}, "", "invalid_cname"},
+	} {
+		msg := new(dns.Msg)
+		for _, text := range tc.records {
+			rr, err := dns.NewRR(text)
+			if err != nil {
+				t.Fatal(err)
+			}
+			msg.Answer = append(msg.Answer, rr)
+		}
+		addresses, reason := answerAddresses(msg, "example.test.", dns.TypeAAAA)
+		if reason != tc.reason || strings.Join(addresses, ",") != tc.want {
+			t.Fatalf("%v %s want %s %s", addresses, reason, tc.want, tc.reason)
+		}
+	}
+}
+
+func TestMalformedValidationResponseIsNotRetried(t *testing.T) {
+	var calls atomic.Int64
+	server := localDNS(t, func(w dns.ResponseWriter, m *dns.Msg) { calls.Add(1); _, _ = w.Write([]byte{0}) }, false)
+	cfg := validationConfig(t, "--validation", "expected", "--expect", "example.test=192.0.2.1", "--validation-retries", "3")
+	results, err := measure(context.Background(), cfg, []endpoint{server})
+	if err != nil || calls.Load() != 1 || results[0].Errors["validation_invalid_response"] != 1 || results[0].ValidationRetries != 0 {
+		t.Fatalf("%+v calls=%d err=%v", results, calls.Load(), err)
+	}
 }

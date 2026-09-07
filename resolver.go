@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"sort"
@@ -26,6 +27,7 @@ type resultStats struct {
 	PrecheckFailures   int            `json:"precheck_failures"`
 	ValidationChecks   int            `json:"validation_checks"`
 	ValidationFailures int            `json:"validation_failures"`
+	ValidationRetries  int            `json:"validation_retries"`
 	Filtered           bool           `json:"filtered"`
 	Reasons            []string       `json:"reasons"`
 	Errors             map[string]int `json:"errors"`
@@ -33,10 +35,11 @@ type resultStats struct {
 }
 
 type queryClient struct {
-	udp, tcp dns.Client
-	limiter  *rate.Limiter
-	fallback bool
-	timeout  time.Duration
+	udp, tcp          dns.Client
+	limiter           *rate.Limiter
+	fallback          bool
+	timeout           time.Duration
+	validationRetries int
 }
 
 // Closing the connection on cancellation also interrupts an in-flight read.
@@ -87,8 +90,10 @@ func (c *queryClient) lookup(ctx context.Context, msg *dns.Msg, address string, 
 			return nil, 0, "canceled"
 		case queryCtx.Err() != nil || (errors.As(err, &networkErr) && networkErr.Timeout()):
 			return nil, 0, "timeout"
-		default:
+		case errors.As(err, &networkErr) || errors.Is(err, io.EOF):
 			return nil, 0, "transport"
+		default:
+			return nil, 0, "invalid_response"
 		}
 	}
 	if reply == nil {
