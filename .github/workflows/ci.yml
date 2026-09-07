@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go mod verify
+      - run: go vet ./...
+      - run: go test -count=1 -timeout=60s ./...
+      - name: Race detector and coverage
+        if: runner.os == 'Linux'
+        run: go test -race -coverprofile=coverage.out -timeout=120s ./...
+      - name: Formatting
+        if: runner.os == 'Linux'
+        run: test -z "$(gofmt -l *.go)"
+      - name: Dependency vulnerability check
+        if: runner.os == 'Linux'
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
+
+  binaries:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [linux, windows, darwin]
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        shell: bash
+        run: |
+          suffix=""
+          if [ "$GOOS" = windows ]; then suffix=".exe"; fi
+          mkdir -p dist
+          go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_SHA}" -o "dist/dnsfaster-${GOOS}-${GOARCH}${suffix}" .
+          cd dist
+          sha256sum * > SHA256SUMS
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: dnsfaster-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/

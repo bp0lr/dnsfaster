@@ -1,2 +1,8 @@
 
 .vscode/
+
+dist/
+coverage.out
+*.test
+dnsfaster
+dnsfaster.exe
