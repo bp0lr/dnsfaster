@@ -1,366 +1,282 @@
 package main
 
 import (
-    "bufio"
-    "fmt"
-    "os"
-    "time"
-    "strings"
-    "sync"
-    "math/rand"
-    
-    "github.com/miekg/dns"
-    flag 	"github.com/spf13/pflag"
+	"bufio"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"net"
+	"net/netip"
+	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/miekg/dns"
+	flag "github.com/spf13/pflag"
 )
 
-const workerExit = "~"
-const workerNotifyExit = "!~"
-const separator = " ----------------------------------------------------------------"
+var version = "dev"
 
-const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-
-type result struct {
-    dns string
-    rtt float64
+type config struct {
+	input, output, domain, format, sortBy                string
+	workers, tests, prechecks, precheckErrors, maxErrors int
+	timeout                                              time.Duration
+	maxTime, minRate, qps                                float64
+	tcpFallback, quiet, includeFiltered                  bool
 }
 
-type resultStats struct {
-    dns         string
-    rtt         float64
-    succ        int
-    fail        int
-    filtered    bool
+func parseConfig(args []string, stderr io.Writer) (config, error) {
+	var c config
+	var saveDNS, showVersion bool
+	fs := flag.NewFlagSet("dnsfaster", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	fs.StringVar(&c.input, "in", "", "Resolver file, or - for stdin (required)")
+	fs.StringVar(&c.output, "out", "", "Output file, or - for stdout")
+	fs.StringVar(&c.domain, "domain", "example.com", "Base domain without wildcard DNS")
+	fs.IntVar(&c.workers, "workers", 10, "Concurrent resolver checks (1-251)")
+	fs.IntVar(&c.tests, "tests", 10, "Measurements per resolver (1-5000)")
+	fs.DurationVar(&c.timeout, "timeout", 2*time.Second, "Timeout per query, including TCP fallback")
+	fs.Float64Var(&c.qps, "qps", 50, "Global query rate limit, including prechecks and TCP retries")
+	fs.IntVar(&c.prechecks, "precheck-tests", 3, "Base-domain checks per resolver (0 disables, maximum 1000)")
+	fs.IntVar(&c.precheckErrors, "precheck-errors", 1, "Allowed failures during prechecks")
+	fs.Float64Var(&c.maxTime, "filter-time", 0, "Maximum mean latency in milliseconds (0 disables)")
+	fs.IntVar(&c.maxErrors, "filter-errors", 0, "Maximum measurement failures (0 disables)")
+	fs.Float64Var(&c.minRate, "filter-rate", 0, "Minimum success percentage (0 disables)")
+	fs.BoolVar(&c.tcpFallback, "tcp-fallback", false, "Retry truncated UDP responses over TCP")
+	fs.BoolVar(&c.quiet, "quiet", false, "Suppress the console report")
+	fs.BoolVar(&c.includeFiltered, "include-filtered", false, "Include rejected resolvers in CSV or JSON exports")
+	fs.BoolVar(&saveDNS, "save-dns", true, "Legacy output selector; false writes headerless CSV")
+	fs.StringVar(&c.format, "format", "", "Output format: dns, csv or json (default dns)")
+	fs.StringVar(&c.sortBy, "sort", "latency", "Sort by latency, rate or input")
+	fs.BoolVar(&showVersion, "version", false, "Print version and exit")
+	if err := fs.Parse(args); err != nil {
+		return c, err
+	}
+	if showVersion {
+		fmt.Fprintln(stderr, version)
+		return c, flag.ErrHelp
+	}
+	if fs.NArg() != 0 {
+		return c, errors.New("unexpected positional arguments")
+	}
+	if c.input == "" {
+		return c, errors.New("--in is required (use --in - for stdin)")
+	}
+	if c.workers < 1 || c.workers > 251 {
+		return c, errors.New("--workers must be between 1 and 251")
+	}
+	if c.tests < 1 || c.tests > 5000 {
+		return c, errors.New("--tests must be between 1 and 5000")
+	}
+	if c.timeout <= 0 {
+		return c, errors.New("--timeout must be positive")
+	}
+	if !finite(c.qps) || c.qps <= 0 || c.qps > 1000000 {
+		return c, errors.New("--qps must be positive and at most 1000000")
+	}
+	if c.prechecks < 0 || c.prechecks > 1000 || c.precheckErrors < 0 {
+		return c, errors.New("invalid precheck limits")
+	}
+	if !finite(c.maxTime) || c.maxTime < 0 || c.maxErrors < 0 || !finite(c.minRate) || c.minRate < 0 || c.minRate > 100 {
+		return c, errors.New("invalid filter thresholds")
+	}
+	c.domain = dns.Fqdn(strings.ToLower(strings.TrimSpace(c.domain)))
+	if !validHostname(strings.TrimSuffix(c.domain, ".")) || len(c.domain) > 237 {
+		return c, errors.New("--domain must be a valid hostname with room for a random label")
+	}
+	if c.format == "" {
+		c.format = "dns"
+		if !saveDNS {
+			c.format = "legacy-csv"
+		}
+	} else if fs.Changed("save-dns") {
+		return c, errors.New("use either --format or --save-dns")
+	}
+	switch c.format {
+	case "dns", "csv", "json", "legacy-csv":
+	default:
+		return c, errors.New("--format must be dns, csv or json")
+	}
+	if c.includeFiltered && (c.format == "dns" || c.format == "legacy-csv") {
+		return c, errors.New("--include-filtered requires --format csv or json")
+	}
+	switch c.sortBy {
+	case "latency", "rate", "input":
+	default:
+		return c, errors.New("--sort must be latency, rate or input")
+	}
+	return c, nil
 }
 
-type testInfo struct {
-    domain string
-    dns string
-    rtt float64
-}
+func finite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
 
-var (
-	numWorkersArg	    int
-	numTestsArg		    int
-    timefilterArg		int
-    errorfilterArg		int
-    ratefilterArg		int
-    
-    saveJustDNSArg		bool
-    
-	inArg		        string
-	outArg            	string
-    testDomainArg     	string
-    
-    globalDNSList       []string
-)
-
-func randStringBytes(n int) string {
-    b := make([]byte, n)
-    for i := range b {
-        b[i] = letterBytes[rand.Intn(len(letterBytes))]
-    }
-    return string(b)
-}
-
-func getDNSList(DNSServersFile string) ([]string, error) {
-    file, err := os.Open(DNSServersFile)
-    if err != nil {
-        return nil, fmt.Errorf("[!!!] Can't open file: %s", DNSServersFile)
-    }
-    defer file.Close()
-
-    var lines []string
-    scanner := bufio.NewScanner(file)
-    for scanner.Scan() {
-        lines = append(lines, scanner.Text())
-    }
-
-    return lines, nil
-}
-
-func printHeader() {
-    fmt.Println(`
-           _            __          _
-          | |          / _|        | |
-        __| |_ __  ___| |_ __ _ ___| |_ ___ _ __
-       / _' | '_ \/ __|  _/ _' / __| __/ _ \ '__|
-      | (_| | | | \__ \ || (_| \__ \ ||  __/ |
-       \__,_|_| |_|___/_| \__,_|___/\__\___|_|
-
-    `)
-
-    fmt.Println(separator)
-    fmt.Printf("| %7d threads     | domain  : %30s |\n", numWorkersArg, testDomainArg)
-    fmt.Printf("| %7d tests       | in file : %30s |\n", numTestsArg, inArg)
-    fmt.Println(separator)
-    fmt.Println("| status |                ip | avg milsec | Rate |  Succ |  Fail |")
-    fmt.Println(separator)
-}
-
-func workerResolverChecker(dc chan *testInfo, receiver chan *testInfo, baseDomain string) {
-    for {
-        test, ok := <-dc
-        if !ok || test.dns == workerExit {
-            break
-        }
-
-        if test.dns == workerNotifyExit {
-            receiver<-nil
-            break
-        }
-
-        c := dns.Client{}
-        m := dns.Msg{}
-
-        m.SetQuestion(test.domain + ".", dns.TypeA)
-        r, rtt, err := c.Exchange(&m, test.dns + ":53")
-
-        // make sure the server responds and returns no entry
-        if err == nil && r != nil && r.Rcode == dns.RcodeNameError {
-            test.rtt = float64(rtt/time.Millisecond)
-        }
-        receiver<-test
-    }
-}
-
-
-func receiverService(rcv chan *testInfo, done chan bool) {
-    
-    var w *bufio.Writer
-
-    results := make(map[string]*resultStats)
-
-    defer func() { done<-true }() // close the channel once done
-
-    if(len(outArg) > 0){
-
-        os.Remove(outArg)
-        file, err := os.OpenFile(outArg, os.O_WRONLY | os.O_CREATE, 0644)
-        if err != nil {
-            fmt.Println("[!] Can't open file to save: ", outArg)
-            return
-        }
-
-        defer file.Close()
-
-        w = bufio.NewWriter(file)
-    }
-
-    for {
-
-        result, ok := <-rcv
-        if !ok || result == nil{
-            break
-        }
-
-        _, prs := results[result.dns]
-        if !prs {
-            results[result.dns] = new(resultStats)
-            results[result.dns].dns = result.dns
-        }
-
-        cur := results[result.dns]
-
-        if result.rtt == -1 {
-            cur.fail++
-        } else {
-            cur.rtt += result.rtt
-            cur.succ++
-        }
-
-        if cur.succ + cur.fail == numTestsArg {
-            if cur.rtt != 0 {
-                cur.rtt = cur.rtt / float64(cur.succ)
-            }
-            succP := cur.succ*100/numTestsArg
-            
-            if timefilterArg > 0 && int(cur.rtt) > timefilterArg{
-                //fmt.Printf("%v filtered by time!: %v  || %v || %v \n", cur.dns, timefilterArg, int(cur.rtt), cur.rtt)
-                cur.filtered = true
-            }
-
-            if errorfilterArg > 0 && cur.fail > errorfilterArg{
-                //fmt.Printf("%v filtered by error!: %v || %v \n", cur.dns, errorfilterArg, cur.fail)
-                cur.filtered = true
-            }
-
-            if ratefilterArg > 0 && succP < ratefilterArg{
-                //fmt.Printf("%v filtered by ratelimit!: %v || %v\n", cur.dns, ratefilterArg, succP)
-                cur.filtered = true
-            }
-
-            if(cur.filtered){
-                fmt.Printf("| FILTER | %17s | %10v | %3d%% | %5d | %5d |\n", cur.dns, int(cur.rtt), succP, cur.succ, cur.fail)
-            }else{                
-                fmt.Printf("| OK     | %17s | %10v | %3d%% | %5d | %5d |\n", cur.dns, int(cur.rtt), succP, cur.succ, cur.fail)
-            }
-                
-            var s string
-            if(saveJustDNSArg){
-                s = fmt.Sprintf("%s\n", cur.dns)
-            } else{
-                s = fmt.Sprintf("%s,%v,%d,%d,%d\n", cur.dns, int(cur.rtt), succP, cur.succ, cur.fail)
-            }
-                            
-            if(len(outArg) > 0){
-                if(!cur.filtered) {
-                    if _, err := w.WriteString(s); err != nil {
-                        fmt.Println(err)
-                        os.Exit(1)
-                    }
-                }
-            }            
-        }
-    }
-    if(len(outArg) > 0){
-        if err := w.Flush(); err != nil {
-        fmt.Println(err)
-        os.Exit(1)
-        }
-    }
-
-    fmt.Println(separator)
-}
-
-func distributorService(){
-
-    rand.Seed(time.Now().UnixNano())
-
-    printHeader()
-
-    if(len(globalDNSList) < 1){
-        fmt.Printf("The DNS server list is empty, I can't go.\n")
-        os.Exit(0)
-    }
-    
-    // pregenerate test cases
-    var domains []string
-    for i := 0; i < numTestsArg; i++ {
-        domains = append(domains, strings.Join([]string{randStringBytes(8), ".", testDomainArg}, ""))
-    }
-
-    dc := make(chan *testInfo, 1000)
-    receiver := make(chan *testInfo, 250)
-
-    rcvDone := make(chan bool)
-
-    go receiverService(receiver, rcvDone)
-
-    for i := 0; i < numWorkersArg; i++ {
-        go workerResolverChecker(dc, receiver, testDomainArg)
-    }
-
-    for i := 0; i < numTestsArg; i++ {
-        for _, dns := range globalDNSList {
-            test := new(testInfo)
-            test.dns = dns
-            test.domain = domains[i]
-            test.rtt = -1
-            dc<-test
-        }
-    }
-
-    for i := 0; i < numWorkersArg; i++ {
-        test := new(testInfo)
-        if i+1 == numWorkersArg { // last worker notifies receiver
-            test.dns = workerNotifyExit
-        } else {
-            test.dns = workerExit
-        }
-        dc<-test
-    }
-
-    <-rcvDone
-}
-
-func checkDNSList(DNSServerList []string){
-
-    jobs := make(chan string)
-	var wg sync.WaitGroup
-	
-	for i := 0; i < 10; i++ {
-		wg.Add(1)
-		go func() {
-			for task := range jobs {				
-                v:=checkTruncation(task)
-                if(!v){
-                    globalDNSList = append(globalDNSList, task)
-                }
+func validHostname(host string) bool {
+	if len(host) == 0 || len(host) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, ch := range label {
+			if !(ch >= 'a' && ch <= 'z' || ch >= '0' && ch <= '9' || ch == '-') {
+				return false
 			}
-			wg.Done()
-		}()
+		}
 	}
-		
-	for _, line := range DNSServerList {
-		jobs <- line
-	}
-	
-	close(jobs)	
-    wg.Wait()
+	return true
 }
 
-func checkTruncation(DNSServer string)bool{
-    
-    var total int = 0
+type endpoint struct{ address, label string }
 
-    for i := 0; i < 20; i++ {
-        
-        c := dns.Client{}
-        m := dns.Msg{}
-    
-        m.SetQuestion("example.com" + ".", dns.TypeA)
-        r, _, err := c.Exchange(&m, DNSServer + ":53")
+func parseEndpoint(value string) (endpoint, error) {
+	host, port := value, "53"
+	if ip, err := netip.ParseAddr(value); err == nil {
+		host = ip.Unmap().String()
+	} else if strings.HasPrefix(value, "[") && strings.HasSuffix(value, "]") {
+		ip, err := netip.ParseAddr(value[1 : len(value)-1])
+		if err != nil {
+			return endpoint{}, errors.New("invalid bracketed IP address")
+		}
+		host = ip.Unmap().String()
+	} else if strings.Contains(value, ":") {
+		var err error
+		host, port, err = net.SplitHostPort(value)
+		if err != nil {
+			return endpoint{}, err
+		}
+	}
+	p, err := strconv.Atoi(port)
+	if err != nil || p < 1 || p > 65535 {
+		return endpoint{}, errors.New("port must be between 1 and 65535")
+	}
+	port = strconv.Itoa(p)
+	if ip, err := netip.ParseAddr(host); err == nil {
+		host = ip.Unmap().String()
+	} else {
+		host = strings.ToLower(strings.TrimSuffix(host, "."))
+		if !validHostname(host) {
+			return endpoint{}, errors.New("invalid resolver hostname or IP address")
+		}
+	}
+	address := net.JoinHostPort(host, port)
+	label := address
+	if port == "53" {
+		label = host
+	}
+	return endpoint{address: address, label: label}, nil
+}
 
-        if(err != nil){
-            //fmt.Printf("err: %v\n", err)
-            total++
-            continue
-        }
+func readResolvers(r io.Reader) ([]endpoint, error) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 4096), 1024*1024)
+	seen := make(map[string]bool)
+	var servers []endpoint
+	line := 0
+	for scanner.Scan() {
+		line++
+		value := strings.TrimSpace(strings.SplitN(strings.TrimPrefix(scanner.Text(), "\ufeff"), "#", 2)[0])
+		if value == "" {
+			continue
+		}
+		server, err := parseEndpoint(value)
+		if err != nil {
+			return nil, fmt.Errorf("line %d: %w", line, err)
+		}
+		if !seen[server.address] {
+			seen[server.address] = true
+			servers = append(servers, server)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("read resolvers: %w", err)
+	}
+	if len(servers) == 0 {
+		return nil, errors.New("resolver list is empty")
+	}
+	return servers, nil
+}
 
-        if (r != nil && r.Truncated) {
-            //fmt.Printf("[truncate | %v]: %v\n", DNSServer, m.Question[0].String())
-            total++
-        }
-    }
-
-    if(total == 0){
-        //fmt.Printf("[%v] truncation OK\n", DNSServer)
-        return false
-    }
-
-    //fmt.Printf("[%v] truncation FAIL\n", DNSServer)
-    return true
+func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	c, err := parseConfig(args, stderr)
+	if errors.Is(err, flag.ErrHelp) {
+		return 0
+	}
+	if err != nil {
+		fmt.Fprintln(stderr, "dnsfaster:", err)
+		return 2
+	}
+	input := stdin
+	if c.input != "-" {
+		f, err := os.Open(c.input)
+		if err != nil {
+			fmt.Fprintln(stderr, "dnsfaster:", err)
+			return 1
+		}
+		defer f.Close()
+		input = f
+	}
+	servers, err := readResolvers(input)
+	if err != nil {
+		fmt.Fprintln(stderr, "dnsfaster:", err)
+		return 1
+	}
+	// Reserve the temporary output before generating network traffic.
+	var output *outputFile
+	if c.output != "" && c.output != "-" {
+		output, err = prepareOutput(c.output, c.input)
+		if err != nil {
+			fmt.Fprintln(stderr, "dnsfaster:", err)
+			return 1
+		}
+		defer output.abort()
+	}
+	results, err := measure(ctx, c, servers)
+	if err != nil {
+		fmt.Fprintln(stderr, "dnsfaster:", err)
+		if errors.Is(err, context.Canceled) {
+			return 130
+		}
+		return 1
+	}
+	sortResults(results, c.sortBy)
+	if !c.quiet {
+		if err := writeReport(stderr, results); err != nil {
+			fmt.Fprintln(stderr, "dnsfaster:", err)
+			return 1
+		}
+	}
+	if c.output != "" {
+		var dest io.Writer = stdout
+		if output != nil {
+			dest = output.file
+		}
+		if err := writeResults(dest, results, c.format, c.includeFiltered); err != nil {
+			fmt.Fprintln(stderr, "dnsfaster:", err)
+			return 1
+		}
+		if output != nil {
+			if err := output.commit(); err != nil {
+				fmt.Fprintln(stderr, "dnsfaster:", err)
+				return 1
+			}
+		}
+	}
+	for _, r := range results {
+		if !r.Filtered {
+			return 0
+		}
+	}
+	return 1
 }
 
 func main() {
-
-    flag.StringVar(&inArg, "in", "", "DNS servers list")
-    flag.StringVar(&outArg, "out", "", "Output file to save the results to")
-    flag.StringVar(&testDomainArg, "domain", "example.com", "Domain name to test against")
-    
-    flag.IntVar(&numWorkersArg, "workers", 10, "Number of workers")
-    flag.IntVar(&numTestsArg, "tests", 10, "Number of test again each dns server")
-    flag.IntVar(&timefilterArg, "filter-time", 0, "Filter results with average response time higher than")
-    flag.IntVar(&errorfilterArg, "filter-errors", 0, "Filter results with error number higher than")
-    flag.IntVar(&ratefilterArg, "filter-rate", 0, "Filter results with average success rate less than")
-    
-    flag.BoolVar(&saveJustDNSArg, "save-dns", true, "Save just the DNS hostname")
-
-    flag.Parse();
-
-    if numWorkersArg < 1 || numWorkersArg > 251 {
-        fmt.Fprintf(os.Stderr, "[!] Invalid number of workers: %d\n", numWorkersArg)
-        return
-    }
-
-    if numTestsArg < 1  || numTestsArg > 5000{
-        fmt.Fprintf(os.Stderr, "[!] Invalid number of tests: %d\n", numTestsArg)
-        return
-    }
-
-    var localDNSList []string
-    localDNSList, _ = getDNSList(inArg)
-    
-    checkDNSList(localDNSList)   
-    distributorService()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	code := run(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr)
+	stop()
+	os.Exit(code)
 }
