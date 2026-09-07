@@ -2,7 +2,8 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: ['**']
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -55,8 +56,10 @@ jobs:
         run: |
           suffix=""
           if [ "$GOOS" = windows ]; then suffix=".exe"; fi
+          version="$GITHUB_SHA"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then version="$GITHUB_REF_NAME"; fi
           mkdir -p dist
-          go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_SHA}" -o "dist/dnsfaster-${GOOS}-${GOARCH}${suffix}" .
+          go build -trimpath -ldflags "-s -w -X main.version=${version}" -o "dist/dnsfaster-${GOOS}-${GOARCH}${suffix}" .
           cd dist
           sha256sum * > SHA256SUMS
       - uses: actions/upload-artifact@v7.0.1
