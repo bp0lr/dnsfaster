@@ -55,7 +55,7 @@ func parseConfig(args []string, stderr io.Writer) (config, error) {
 	fs.IntVar(&c.tests, "tests", 10, "Measurements per resolver (1-5000)")
 	fs.DurationVar(&c.timeout, "timeout", 2*time.Second, "Timeout per query, including TCP fallback")
 	fs.Float64Var(&c.qps, "qps", 50, "Global query rate limit, including prechecks and TCP retries")
-	fs.IntVar(&c.prechecks, "precheck-tests", 3, "Extra base-domain checks (default 0 with validation, 3 when off; maximum 1000)")
+	fs.IntVar(&c.prechecks, "precheck-tests", 0, "Extra base-domain checks (default 0 with validation, 3 when off; maximum 1000)")
 	fs.IntVar(&c.precheckErrors, "precheck-errors", 1, "Allowed failures during prechecks")
 	fs.Float64Var(&c.maxTime, "filter-time", 0, "Maximum mean latency in milliseconds (0 disables)")
 	fs.Float64Var(&c.maxP95, "filter-p95", 0, "Maximum p95 latency in milliseconds (0 disables)")
@@ -87,8 +87,8 @@ func parseConfig(args []string, stderr io.Writer) (config, error) {
 	if c.showVersion {
 		return c, nil
 	}
-	if !fs.Changed("precheck-tests") && c.validation != "off" {
-		c.prechecks = 0
+	if !fs.Changed("precheck-tests") && c.validation == "off" {
+		c.prechecks = 3
 	}
 	if fs.NArg() != 0 {
 		return c, errors.New("unexpected positional arguments")
