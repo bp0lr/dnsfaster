@@ -59,6 +59,11 @@ func (c *queryClient) query(ctx context.Context, msg *dns.Msg, address string, e
 
 func (c *queryClient) lookup(ctx context.Context, msg *dns.Msg, address string, expected int) (*dns.Msg, float64, string) {
 	if err := c.limiter.Wait(ctx); err != nil {
+		// Wait may reject a reservation before the parent deadline expires.
+		// Do not turn unscheduled queries into completed failed samples.
+		if _, bounded := ctx.Deadline(); bounded && ctx.Err() == nil {
+			<-ctx.Done()
+		}
 		return nil, 0, "canceled"
 	}
 	queryCtx, cancel := context.WithTimeout(ctx, c.timeout)

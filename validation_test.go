@@ -366,6 +366,23 @@ func TestWholeRunDeadline(t *testing.T) {
 	}
 }
 
+func TestWholeRunRateBudgetPreservesOutput(t *testing.T) {
+	server := localDNS(t, func(w dns.ResponseWriter, m *dns.Msg) { replyWith(w, m, dns.RcodeNameError) }, false)
+	target := filepath.Join(t.TempDir(), "results.txt")
+	if err := os.WriteFile(target, []byte("previous\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var report bytes.Buffer
+	code := run(context.Background(), []string{"--resolver", server.label, "--validation", "off", "--precheck-tests", "0", "--tests", "10", "--qps", "1", "--max-duration", "30ms", "--out", target}, strings.NewReader(""), io.Discard, &report)
+	if code != 1 || !strings.Contains(report.String(), "deadline exceeded") {
+		t.Fatalf("code=%d %s", code, report.String())
+	}
+	data, _ := os.ReadFile(target)
+	if string(data) != "previous\n" {
+		t.Fatalf("overwrote output: %s", data)
+	}
+}
+
 func TestInstalledVersionAndStdout(t *testing.T) {
 	for _, tc := range []struct {
 		info *debug.BuildInfo
