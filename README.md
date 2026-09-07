@@ -1,41 +1,86 @@
-## dnsfaster
+# dnsfaster
 
+Check DNS resolvers for response time and reliability, then export the servers that meet your thresholds.
 
-### why?
+dnsfaster sends A queries for random subdomains of a test domain. A successful measurement is an `NXDOMAIN` response, indicating that the queried name does not exist. It measures this specific behavior, not general DNS correctness or browsing speed.
 
-I have started working on an app to brute force subdomains using mutations, permutations and alterations.
-This will test millions of combinations again a list of DNS servers. I need a tool to keep my DNS servers list clean and fast.
-I didn't found anything to fit what I want at 100%, so I take dnsfaster and I change some things.
+## Install
 
+Install [Go](https://go.dev/dl/), then run:
 
-### what dnsfaster does
-
-This tool will test (many times) your DNS list again a test domain to validate responses.
-This is useful if you want to keep your DNS list under an error rate or speed limit.
-
-
-### Install
-
-Install is quick and clean
-```
-go get github.com/bp0lr/dnsfaster
+```sh
+go install github.com/bp0lr/dnsfaster@latest
 ```
 
+Make sure your Go binary directory (`go env GOPATH`, followed by `bin`) is in your `PATH`.
 
-### examples
+To build from source:
+
+```sh
+git clone https://github.com/bp0lr/dnsfaster.git
+cd dnsfaster
+go build -o dnsfaster .
 ```
-dnsfaster --domain example.com --in "dnslist.txt" --out "resolvers.txt" --tests 1000 --workers 50 --filter-time 400 --filter-errors 50 --filter-rate 90 --save-dns
+
+On Windows, use `go build -o dnsfaster.exe .`.
+
+## Quick start
+
+Create `dnslist.txt` with one resolver IPv4 address per line. Use resolvers you operate or that permit this traffic.
+
+```text
+127.0.0.1
 ```
 
-this will run dnsfaster again the dns servers in dnslist.txt, testing 1000 times on each server using 50 workers, and filter out the domains with response time average > 400ms, errors > 50 and sucess rate < 90%.
-Use --save-dns if you want just the dns ip saved in the result file.
+Run a small check against your local DNS resolver:
 
-
-### Why dnsfaster was not forked
-
-the original author has moved out his repo to gitlab.
-You can visit his version at
+```sh
+dnsfaster --in dnslist.txt --out resolvers.txt --tests 10
 ```
-https://gitlab.com/jules.rigaudie/dnsfaster
+
+Filter by latency and reliability:
+
+```sh
+dnsfaster --in dnslist.txt --out resolvers.txt --domain example.com --tests 100 --workers 10 --filter-time 400 --filter-errors 10 --filter-rate 90
 ```
-thanks @jules.rigaudie for your work. :)
+
+The output file contains only servers that pass every enabled filter. The console also shows filtered results.
+
+## Options
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `--in` | Required | File containing one resolver per line. |
+| `--out` | Unset | Save passing resolvers to this file. |
+| `--domain` | `example.com` | Base domain for random subdomain queries. |
+| `--workers` | `10` | Concurrent workers, from 1 to 251. |
+| `--tests` | `10` | Measurements per resolver, from 1 to 5000. |
+| `--filter-time` | `0` | Reject average latency above this many milliseconds. Zero disables the filter. |
+| `--filter-errors` | `0` | Reject failure counts above this threshold. Zero disables the filter. |
+| `--filter-rate` | `0` | Reject success percentages below this threshold. Zero disables the filter. |
+| `--save-dns` | `true` | Write only resolver addresses. Use `--save-dns=false` for CSV rows. |
+
+CSV output currently has no header and uses these columns:
+
+```text
+resolver,average_ms,success_percent,successes,failures
+```
+
+## Measurement notes
+
+- Before measurements, each resolver receives 20 additional A queries for `example.com`. Any exchange error or truncated response excludes it from the measurement stage.
+- The test domain must return `NXDOMAIN` for random nonexistent subdomains. Wildcard DNS can make a working resolver fail this test.
+- Reported latency averages successful measurements only. Current output uses whole milliseconds.
+- DNS caching, network conditions and the chosen domain affect results. Compare runs under similar conditions.
+- The current implementation expects IPv4 addresses and uses port 53 over UDP.
+
+## Development
+
+```sh
+go test ./...
+go vet ./...
+```
+
+## Credits
+
+This project was adapted from [Jules Rigaudie's dnsfaster](https://gitlab.com/jules.rigaudie/dnsfaster). The original project moved to GitLab, which is why this repository is not a GitHub fork. Thanks to Jules for the original work.
